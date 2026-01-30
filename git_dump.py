@@ -30,6 +30,7 @@ class RepoProcessor:
         end_delimiter: str = "--- END FILE ---",
         verbose: bool = True,
         dry_run: bool = False,
+        max_size: int = 512000,
     ):
         self.repo_path = os.path.abspath(repo_path)
         self.output_file = os.path.abspath(output_file)
@@ -40,6 +41,7 @@ class RepoProcessor:
         self.end_delimiter = end_delimiter
         self.verbose = verbose
         self.dry_run = dry_run
+        self.max_size = max_size
         self.spec = self._load_spec()
 
     def _load_spec(self):
@@ -120,6 +122,15 @@ class RepoProcessor:
 
                         file_path = os.path.join(root, filename)
                         try:
+                            if self.max_size is not None:
+                                try:
+                                    if os.path.getsize(file_path) > self.max_size:
+                                        if self.verbose:
+                                            print(f"Skipping '{rel_file}' - exceeds max size ({self.max_size} bytes)")
+                                        continue
+                                except OSError:
+                                    pass
+
                             if self._is_binary(file_path):
                                 continue
 
@@ -195,6 +206,9 @@ def main():
     parser.add_argument(
         "--dry-run", action="store_true", help="Do not write output file"
     )
+    parser.add_argument(
+        "--max-size", type=int, default=512000, help="Maximum file size in bytes to include (default: 512000)"
+    )
 
     args = parser.parse_args()
 
@@ -212,6 +226,7 @@ def main():
         end_delimiter=args.end_delimiter,
         verbose=args.verbose,
         dry_run=args.dry_run,
+        max_size=args.max_size,
     )
 
     if args.verbose:
