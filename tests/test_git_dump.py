@@ -2,7 +2,8 @@ import os
 import shutil
 import tempfile
 import pytest
-from src.git_dump.core import RepoProcessor
+from pathlib import Path
+from src.git_dump.core import RepoProcessor, get_language_from_path, BINARY_EXTENSIONS
 
 
 class TestRepoProcessor:
@@ -29,9 +30,9 @@ class TestRepoProcessor:
         assert count == 2
         with open(self.output_file, "r", encoding="utf-8") as f:
             content = f.read()
-            assert "--- FILE: file1.txt ---" in content
+            assert "### File: file1.txt" in content
             assert "content1" in content
-            assert "--- FILE: dir/file2.txt ---" in content
+            assert "### File: dir/file2.txt" in content
             assert "content2" in content
 
     def test_ignore_git(self):
@@ -85,7 +86,7 @@ class TestRepoProcessor:
             assert "subdir/public.txt" in content
             assert "app.log" not in content  # Excluded by root .gitignore
             # The file 'subdir/secret.txt' should not appear in the output (not the string "secret.txt")
-            assert "--- FILE: subdir/secret.txt ---" not in content  # Excluded by nested .gitignore
+            assert "### File: subdir/secret.txt" not in content  # Excluded by nested .gitignore
             assert ".gitignore" in content  # Root .gitignore file itself is included
             assert "subdir/.gitignore" in content  # Nested .gitignore file itself is included
 
@@ -118,6 +119,21 @@ class TestRepoProcessor:
             content = f.read()
             assert "START file1.txt" in content
             assert "END file1.txt" in content
+
+    def test_markdown_delimiters_with_language(self):
+        """Test that markdown delimiters include language hints."""
+        self.create_file("main.py", "print('hello')")
+        self.create_file("script.js", "console.log('hi')")
+        self.create_file("README.md", "# Project")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert "```python" in content
+            assert "```javascript" in content
+            assert "```markdown" in content
 
     def test_dry_run(self):
         self.create_file("file1.txt", "content1")
@@ -183,23 +199,23 @@ class TestRepoProcessor:
 
         with open(self.output_file, "r", encoding="utf-8") as f:
             content = f.read()
-            
+
         # Tree section
         tree_start = content.index("--- REPOSITORY STRUCTURE ---")
         tree_end = content.index("--- END REPOSITORY STRUCTURE ---")
         tree_section = content[tree_start:tree_end]
-        
+
         # Tree should NOT mention .log files (they're ignored)
         assert "app.log" not in tree_section
         assert "debug.log" not in tree_section
-        
+
         # Tree SHOULD mention .py files
         assert "main.py" in tree_section
         assert "test.py" in tree_section
-        
+
         # Dump section should also NOT contain .log file contents
-        assert "--- FILE: app.log ---" not in content
-        assert "--- FILE: subdir/debug.log ---" not in content
+        assert "### File: app.log" not in content
+        assert "### File: subdir/debug.log" not in content
 
     def test_tree_structure_method(self):
         """Test the generate_tree_structure method directly."""
@@ -218,6 +234,62 @@ class TestRepoProcessor:
         assert "subdir/" in tree
         assert "test.py" in tree
 
+    def test_token_counting_includes_delimiters(self):
+        """Test that token counting includes delimiters."""
+        self.create_file("main.py", "print('hello')")
+
+        processor = RepoProcessor(
+            self.test_dir, 
+            self.output_file, 
+            count_tokens=True,
+            include_tree=False
+        )
+        processor.process()
+
+        # Token count should be > 0 and include delimiters
+        assert processor.total_tokens > 0
+        # The delimiters "### File: main.py" and "```" should be counted
+
+    def test_token_counting_includes_tree(self):
+        """Test that token counting includes the tree structure."""
+        self.create_file("main.py", "print('hello')")
+
+        processor_with_tree = RepoProcessor(
+            self.test_dir, 
+            self.output_file, 
+            count_tokens=True,
+            include_tree=True
+        )
+        processor_with_tree.process()
+
+        processor_no_tree = RepoProcessor(
+            self.test_dir, 
+            self.output_file, 
+            count_tokens=True,
+            include_tree=False
+        )
+        processor_no_tree.process()
+
+        # Token count with tree should be higher
+        assert processor_with_tree.total_tokens > processor_no_tree.total_tokens
+
+    def test_binary_extension_check(self):
+        """Test that binary extensions are detected without reading content."""
+        processor = RepoProcessor(self.test_dir, self.output_file)
+        
+        # Test various binary extensions
+        for ext in ['.png', '.jpg', '.exe', '.pdf', '.zip']:
+            fake_path = Path(f"fake{ext}")
+            assert processor._is_binary(fake_path) is True, f"Failed for {ext}"
+
+    def test_get_language_from_path(self):
+        """Test language detection from file extension."""
+        assert get_language_from_path("test.py") == "python"
+        assert get_language_from_path("script.js") == "javascript"
+        assert get_language_from_path("app.ts") == "typescript"
+        assert get_language_from_path("README.md") == "markdown"
+        assert get_language_from_path("unknown.xyz") == ""
+
 
 def test_gitignore_cache():
     """Test that gitignore specs are cached properly."""
@@ -226,27 +298,27 @@ def test_gitignore_cache():
         # Create nested .gitignore files
         os.makedirs(os.path.join(test_dir, "subdir1"))
         os.makedirs(os.path.join(test_dir, "subdir2"))
-        
+
         with open(os.path.join(test_dir, ".gitignore"), "w") as f:
             f.write("*.log\n")
         with open(os.path.join(test_dir, "subdir1", ".gitignore"), "w") as f:
             f.write("*.tmp\n")
-        
+
         output_file = os.path.join(test_dir, "output.txt")
         processor = RepoProcessor(test_dir, output_file)
-        
+
         # First call should load and cache
-        spec1 = processor._load_nested_gitignore(os.path.join(test_dir, "subdir1"))
+        spec1 = processor._load_nested_gitignore(Path(os.path.join(test_dir, "subdir1")))
         assert spec1 is not None
-        
+
         # Second call should return cached version
-        spec2 = processor._load_nested_gitignore(os.path.join(test_dir, "subdir1"))
+        spec2 = processor._load_nested_gitignore(Path(os.path.join(test_dir, "subdir1")))
         assert spec2 is spec1  # Same object (cached)
-        
+
         # Non-existent gitignore should cache None
-        spec3 = processor._load_nested_gitignore(os.path.join(test_dir, "subdir2"))
+        spec3 = processor._load_nested_gitignore(Path(os.path.join(test_dir, "subdir2")))
         assert spec3 is None
-        
+
         # Should be cached
         assert os.path.join(test_dir, "subdir2") in processor.gitignore_cache
     finally:

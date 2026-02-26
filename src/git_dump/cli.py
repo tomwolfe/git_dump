@@ -24,9 +24,9 @@ def main():
         "-o", "--output", default="repository_contents.txt", help="Output filename"
     )
     parser.add_argument(
-        "--no-gitignore", 
-        action="store_false", 
-        dest="use_gitignore", 
+        "--no-gitignore",
+        action="store_false",
+        dest="use_gitignore",
         help="Do not respect .gitignore files"
     )
     parser.add_argument(
@@ -36,10 +36,14 @@ def main():
         "--include", action="append", help="Patterns to include (e.g., '*.py')"
     )
     parser.add_argument(
-        "--start-delimiter", default="--- FILE: {path} ---", help="Custom start delimiter"
+        "--start-delimiter", 
+        default="### File: {path}\n```{lang}", 
+        help="Custom start delimiter (use {path} and {lang} placeholders)"
     )
     parser.add_argument(
-        "--end-delimiter", default="--- END FILE ---", help="Custom end delimiter"
+        "--end-delimiter", 
+        default="```", 
+        help="Custom end delimiter"
     )
     parser.add_argument(
         "-q", "--quiet", action="store_false", dest="verbose", help="Quiet mode"
@@ -55,6 +59,10 @@ def main():
     )
     parser.add_argument(
         "--count-tokens", action="store_true", help="Count total tokens in output (requires tiktoken if available)"
+    )
+    parser.add_argument(
+        "--clipboard", "--clip", action="store_true", dest="use_clipboard", 
+        help="Copy output to clipboard (requires pyperclip: pip install pyperclip)"
     )
 
     args = parser.parse_args()
@@ -78,6 +86,7 @@ def main():
         max_file_size=args.max_size,
         include_tree=args.include_tree,
         count_tokens=args.count_tokens,
+        use_clipboard=args.use_clipboard,
     )
 
     if args.verbose:
@@ -96,6 +105,8 @@ def main():
             if args.count_tokens:
                 print(f"Total estimated tokens: {processor.total_tokens}")
             print(f"Result saved to: {processor.output_file}")
+            if args.use_clipboard:
+                print("Output also copied to clipboard.")
         else:
             print("\nNo files were processed.")
 
