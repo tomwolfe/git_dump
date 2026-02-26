@@ -83,6 +83,10 @@ def main():
         "--count-tokens", action="store_true", help="Count total tokens in output (requires tiktoken if available)"
     )
     parser.add_argument(
+        "--model", type=str, default="gpt-4",
+        help="Target model for token counting (gpt-4, gpt-4o, gpt-3.5-turbo, claude, llama). Default: gpt-4"
+    )
+    parser.add_argument(
         "--clipboard", "--clip", action="store_true", dest="use_clipboard",
         help="Copy output to clipboard (requires pyperclip: pip install pyperclip)"
     )
@@ -93,6 +97,10 @@ def main():
     parser.add_argument(
         "--clean", action="store_true", dest="clean_mode",
         help="Clean files by removing comments and excessive whitespace to reduce token count"
+    )
+    parser.add_argument(
+        "--clean-aggressive", action="store_true", dest="clean_aggressive",
+        help="Aggressive cleaning: also remove docstrings and collapse all empty lines (use with --clean)"
     )
     parser.add_argument(
         "--skeleton", action="store_true", dest="skeleton_mode",
@@ -126,6 +134,22 @@ def main():
         "--focus", type=str, default=None,
         help="Focus directory: include full content for this directory, skeletonize others"
     )
+    parser.add_argument(
+        "--diff", type=str, default=None, dest="diff_branch",
+        help="Diff mode: compare current HEAD against specified branch (changed files get full content, others skeletonized)"
+    )
+    parser.add_argument(
+        "--diff-staged", action="store_true", dest="diff_staged",
+        help="Diff staged changes only: compare staged changes against HEAD"
+    )
+    parser.add_argument(
+        "--deps", "--resolve-deps", action="store_true", dest="resolve_deps",
+        help="Auto-include skeletons of imported modules for focused/changed files"
+    )
+    parser.add_argument(
+        "--interactive", action="store_true", dest="interactive",
+        help="Interactive mode: select files using a TUI checkbox menu (requires questionary)"
+    )
 
     args = parser.parse_args()
 
@@ -134,6 +158,33 @@ def main():
         sys.exit(1)
 
     setup_logging(args.verbose)
+
+    # Handle interactive mode
+    include_patterns = args.include
+    if args.interactive:
+        try:
+            from .interactive import run_interactive_with_tree
+            print("\n📦 Interactive File Selection\n")
+            print("Use Space to toggle files, A to toggle all, Enter to confirm\n")
+            
+            selected_files, tree = run_interactive_with_tree(args.repo_path)
+            
+            if not selected_files:
+                print("No files selected. Exiting.")
+                sys.exit(0)
+            
+            print(f"\n✓ Selected {len(selected_files)} files\n")
+            
+            # Use selected files as include patterns
+            include_patterns = selected_files
+            
+        except ImportError as e:
+            print(f"Error: {e}")
+            print("Install questionary with: pip install questionary")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            print("\n\nCancelled.")
+            sys.exit(0)
 
     # Find config file if not specified
     config_path = args.config
@@ -146,7 +197,7 @@ def main():
         args.repo_path,
         args.output,
         ignore_patterns=args.ignore,
-        include_patterns=args.include,
+        include_patterns=include_patterns,
         use_gitignore=args.use_gitignore,
         start_delimiter=args.start_delimiter,
         end_delimiter=args.end_delimiter,
@@ -157,7 +208,9 @@ def main():
         count_tokens=args.count_tokens,
         use_clipboard=args.use_clipboard,
         max_tokens=args.max_tokens,
+        target_model=args.model,
         clean_mode=args.clean_mode,
+        clean_aggressive=args.clean_aggressive,
         sort_priority=args.sort_priority,
         git_branch=args.branch,
         git_commit=args.commit,
@@ -167,6 +220,9 @@ def main():
         skeleton_threshold=args.skeleton_threshold,
         config_file=config_path,
         focus_dir=args.focus,
+        diff_branch=args.diff_branch,
+        diff_staged=args.diff_staged,
+        resolve_dependencies=args.resolve_deps,
     )
 
     if args.verbose:

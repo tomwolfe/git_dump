@@ -358,6 +358,12 @@ def get_tiktoken_token_count(text: str, encoding_name: str = "cl100k_base") -> i
     """
     Get exact token count using tiktoken if available.
 
+    Supports various model encodings:
+    - cl100k_base: GPT-4, GPT-3.5-turbo, text-embedding-ada-002
+    - p50k_base: Codex models, text-davinci-002, text-davinci-003
+    - r50k_base: GPT-3 models like davinci
+    - o200k_base: GPT-4o models
+
     Args:
         text: Input text to count tokens for
         encoding_name: Name of the encoding to use
@@ -372,6 +378,59 @@ def get_tiktoken_token_count(text: str, encoding_name: str = "cl100k_base") -> i
     except ImportError:
         # Fallback to character-based estimation
         return estimate_tokens(text)
+    except Exception:
+        # If encoding fails, fallback to estimation
+        return estimate_tokens(text)
+
+
+def get_token_count_for_model(text: str, model: str = "gpt-4") -> int:
+    """
+    Get token count optimized for specific model families.
+
+    Args:
+        text: Input text to count tokens for
+        model: Model name or family (gpt-4, gpt-3.5-turbo, codex, claude, llama)
+
+    Returns:
+        Token count (exact for tiktoken-supported models, estimated otherwise)
+    """
+    # Map model names to tiktoken encodings
+    model_to_encoding = {
+        "gpt-4": "cl100k_base",
+        "gpt-4-turbo": "cl100k_base",
+        "gpt-4o": "o200k_base",
+        "gpt-3.5-turbo": "cl100k_base",
+        "gpt-3.5": "cl100k_base",
+        "text-davinci-003": "p50k_base",
+        "text-davinci-002": "p50k_base",
+        "davinci": "r50k_base",
+        "codex": "p50k_base",
+        "code-davinci-002": "p50k_base",
+    }
+
+    # Normalize model name
+    model_lower = model.lower()
+
+    # Find matching encoding
+    encoding_name = None
+    for model_key, enc in model_to_encoding.items():
+        if model_key in model_lower:
+            encoding_name = enc
+            break
+
+    # Default to cl100k_base for OpenAI models
+    if encoding_name is None:
+        if "claude" in model_lower:
+            # Claude uses similar tokenization to GPT-3.5/4
+            encoding_name = "cl100k_base"
+        elif "llama" in model_lower:
+            # Llama uses SentencePiece, approximate with cl100k_base
+            encoding_name = "cl100k_base"
+        else:
+            # Default to GPT-4 encoding
+            encoding_name = "cl100k_base"
+
+    return get_tiktoken_token_count(text, encoding_name)
 
 
 def get_language_from_path(path: str) -> str:
@@ -413,7 +472,9 @@ class RepoProcessor:
         count_tokens: bool = False,
         use_clipboard: bool = False,
         max_tokens: Optional[int] = None,
+        target_model: str = "gpt-4",  # New: target model for token counting
         clean_mode: bool = False,
+        clean_aggressive: bool = False,  # New: aggressive cleaning removes docstrings too
         sort_priority: bool = True,
         git_branch: Optional[str] = None,
         git_commit: Optional[str] = None,
@@ -423,6 +484,9 @@ class RepoProcessor:
         skeleton_threshold: int = 1000,  # Token threshold for skeleton mode
         config_file: Optional[str] = None,  # New: Path to config file
         focus_dir: Optional[str] = None,  # New: Focus directory for context pinning
+        diff_branch: Optional[str] = None,  # New: Branch to compare against for diff mode
+        diff_staged: bool = False,  # New: Compare staged changes only
+        resolve_dependencies: bool = False,  # New: Auto-include imported modules
     ):
         self.repo_path = Path(repo_path).resolve()
         self.output_file = Path(output_file).resolve()
@@ -436,7 +500,9 @@ class RepoProcessor:
         self.count_tokens = count_tokens
         self.use_clipboard = use_clipboard
         self.max_tokens = max_tokens
+        self.target_model = target_model
         self.clean_mode = clean_mode
+        self.clean_aggressive = clean_aggressive
         self.sort_priority = sort_priority
         self.git_branch = git_branch
         self.git_commit = git_commit
@@ -446,6 +512,9 @@ class RepoProcessor:
         self.skeleton_threshold = skeleton_threshold
         self.config_file = config_file
         self.focus_dir = focus_dir
+        self.diff_branch = diff_branch
+        self.diff_staged = diff_staged
+        self.resolve_dependencies = resolve_dependencies  # New: auto-include imported modules
         self.total_tokens = 0
 
         # Set delimiters based on format choice
@@ -784,6 +853,11 @@ class RepoProcessor:
         - Excessive blank lines (more than 2 consecutive)
         - Leading/trailing whitespace on each line
         - Non-docstring comments (for supported languages)
+        
+        If clean_aggressive is enabled:
+        - Removes all docstrings and string literals
+        - Collapses multiple empty lines into single empty line
+        - Removes all blank lines at the start/end of functions
 
         Args:
             content: Original file content
@@ -801,14 +875,15 @@ class RepoProcessor:
             return content
 
         lines = content.splitlines()
-        
+
         # Strip license headers first
         lines = self._strip_license_headers(lines)
-        
+
         cleaned_lines = []
         in_multiline_comment = False
         in_docstring = False
         prev_blank_count = 0
+        consecutive_blanks = 0
 
         # Detect language from extension or content heuristics
         if not lang:
@@ -826,30 +901,43 @@ class RepoProcessor:
             is_js_ts = lang in ('javascript', 'typescript')
             is_c_style = lang in ('c', 'cpp', 'java', 'go', 'rust')
 
+        # Aggressive mode: track if we're inside a function for extra cleanup
+        in_function = False
+        function_indent = 0
+        skip_docstrings = self.clean_aggressive
+
         for i, line in enumerate(lines):
             stripped_line = line.strip()
-            
+
             # Handle Python docstrings
             if is_python:
-                if (stripped_line.startswith(('"""', "'''")) or 
-                    stripped_line.endswith(('"""', "'''"))):
-                    # It's a docstring or start/end of one
-                    # Simplified: if it's on a line that looks like a docstring, keep it
-                    # In a real implementation, we'd use a state machine to track properly
-                    cleaned_lines.append(line.rstrip())
-                    continue
+                # Check for docstring start/end
+                if skip_docstrings:
+                    if (stripped_line.startswith(('"""', "'''")) or
+                        stripped_line.endswith(('"""', "'''"))):
+                        # It's a docstring - skip it in aggressive mode
+                        if stripped_line.count('"""') == 2 or stripped_line.count("'''") == 2:
+                            # Single-line docstring - skip entirely
+                            continue
+                        else:
+                            # Multi-line docstring - toggle state
+                            in_docstring = not in_docstring
+                            continue
+                    
+                    if in_docstring:
+                        continue
 
                 # Python: remove # comments but keep shebangs and encoding declarations
                 if '#' in line and not stripped_line.startswith('#!') and 'coding:' not in line:
                     line = self._remove_python_comment(line)
-            
+
             # Handle JS/TS/C-style multiline comments and JSDoc
             elif is_js_ts or is_c_style:
                 if in_multiline_comment:
-                    # Check if it's a JSDoc we want to keep
-                    if stripped_line.startswith('*'):
+                    # Check if it's a JSDoc we want to keep (unless aggressive mode)
+                    if stripped_line.startswith('*') and not self.clean_aggressive:
                         cleaned_lines.append(line.rstrip())
-                    
+
                     if '*/' in line:
                         in_multiline_comment = False
                         if not stripped_line.startswith('*'):
@@ -859,12 +947,19 @@ class RepoProcessor:
                     else:
                         continue
 
-                # Detect JSDoc start
+                # Detect JSDoc start (skip in aggressive mode)
                 if '/**' in line:
-                    cleaned_lines.append(line.rstrip())
-                    in_multiline_comment = True
-                    continue
-                
+                    if self.clean_aggressive:
+                        # Skip entire JSDoc block
+                        if '*/' in line:
+                            continue
+                        in_multiline_comment = True
+                        continue
+                    else:
+                        cleaned_lines.append(line.rstrip())
+                        in_multiline_comment = True
+                        continue
+
                 # Check for /* start of regular multi-line comment (to remove)
                 if '/*' in line:
                     if '*/' in line:
@@ -882,21 +977,35 @@ class RepoProcessor:
 
             # Track consecutive blank lines
             if not line.strip():
-                prev_blank_count += 1
-                if prev_blank_count <= 2:  # Allow up to 2 consecutive blank lines
-                    cleaned_lines.append(line)
+                if self.clean_aggressive:
+                    # Aggressive mode: only allow 1 blank line, not 2
+                    consecutive_blanks += 1
+                    if consecutive_blanks <= 1:
+                        cleaned_lines.append(line)
+                else:
+                    prev_blank_count += 1
+                    if prev_blank_count <= 2:  # Allow up to 2 consecutive blank lines
+                        cleaned_lines.append(line)
             else:
+                consecutive_blanks = 0
                 prev_blank_count = 0
                 cleaned_lines.append(line)
 
         result = '\n'.join(cleaned_lines)
-        
+
+        # Aggressive mode: additional post-processing
+        if self.clean_aggressive:
+            # Remove multiple consecutive blank lines (more than 1)
+            result = re.sub(r'\n{3,}', '\n\n', result)
+            # Remove blank lines at the start and end
+            result = result.strip() + '\n'
+
         # Apply skeleton mode if enabled and content is still large
         if self.skeleton_mode:
             result_tokens = estimate_tokens(result)
             if result_tokens > self.skeleton_threshold:
                 result = self._extract_skeleton(result, lang)
-        
+
         return result
 
     def _remove_python_comment(self, line: str) -> str:
@@ -1116,65 +1225,472 @@ class RepoProcessor:
     def _extract_skeleton_regex(self, content: str, lang: str) -> str:
         """
         Extract skeleton using regex patterns (fallback when tree-sitter unavailable).
-        
+
+        Implements robust pattern matching for:
+        - Python: decorators, functions, classes, async defs
+        - TypeScript/JavaScript: interfaces, types, classes, functions, arrow functions
+        - Rust: traits, impl blocks, structs, enums, functions
+        - Go: interfaces, structs, functions, methods
+        - Java/C++: classes, interfaces, methods
+
         Args:
             content: Original source code
             lang: Language identifier
-            
+
         Returns:
             Skeletonized version with function bodies replaced by pass/{}
         """
         lines = content.splitlines()
         result_lines = []
-        skip_until_dedent = False
-        brace_depth = 0
-        
+
         if lang == 'python':
-            for i, line in enumerate(lines):
-                stripped = line.lstrip()
-                
-                # Keep function/class definitions
-                if stripped.startswith(('def ', 'class ', 'async def ')):
-                    result_lines.append(line.rstrip())
-                    result_lines.append('    pass')
-                    skip_until_dedent = True
-                    continue
-                
-                # Keep imports and module-level statements
-                if stripped.startswith(('import ', 'from ')) or (not stripped and result_lines):
-                    result_lines.append(line.rstrip())
-                    continue
-                
-                # Skip indented lines (function bodies)
-                if skip_until_dedent:
-                    if stripped and not line[0].isspace():
-                        skip_until_dedent = False
-                        result_lines.append(line.rstrip())
-                elif not line[0].isspace() if line else True:
-                    result_lines.append(line.rstrip())
-                    
-        elif lang in ('javascript', 'typescript', 'java', 'cpp', 'c', 'go', 'rust'):
-            for line in lines:
-                stripped = line.strip()
-                
-                # Keep function/class declarations
-                if any(kw in stripped for kw in ['function ', 'class ', 'interface ', 'struct ', 'impl ']):
-                    result_lines.append(line.rstrip())
-                    if '{' not in line:
-                        result_lines.append('{}')
-                    continue
-                
-                # Track brace depth for C-style languages
-                brace_depth += line.count('{') - line.count('}')
-                
-                # Keep lines at top level (brace_depth == 0) or declarations
-                if brace_depth <= 1:
-                    result_lines.append(line.rstrip())
+            result_lines = self._extract_python_skeleton_regex(lines)
+        elif lang in ('typescript', 'javascript'):
+            result_lines = self._extract_ts_js_skeleton_regex(lines, lang)
+        elif lang == 'rust':
+            result_lines = self._extract_rust_skeleton_regex(lines)
+        elif lang == 'go':
+            result_lines = self._extract_go_skeleton_regex(lines)
+        elif lang in ('java', 'cpp', 'c', 'csharp', 'kotlin', 'scala'):
+            result_lines = self._extract_c_style_skeleton_regex(lines, lang)
         else:
             # Unknown language - return original
             return content
-        
+
         return '\n'.join(result_lines)
+
+    def _extract_python_skeleton_regex(self, lines: List[str]) -> List[str]:
+        """Extract Python skeleton with support for decorators and async functions."""
+        result_lines = []
+        in_class = False
+        class_indent = 0
+        in_function = False
+        function_indent = 0
+
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            current_indent = len(line) - len(stripped)
+
+            # Skip empty lines at the top
+            if not stripped and not result_lines:
+                continue
+
+            # Detect decorators (@something)
+            if stripped.startswith('@'):
+                result_lines.append(line.rstrip())
+                continue
+
+            # Detect class definitions
+            class_match = re.match(r'^(async\s+)?class\s+\w+', stripped)
+            if class_match:
+                result_lines.append(line.rstrip())
+                result_lines.append('    pass')
+                in_class = True
+                class_indent = current_indent
+                in_function = False
+                continue
+
+            # Detect function definitions (including async and methods)
+            func_match = re.match(r'^(async\s+)?def\s+\w+', stripped)
+            if func_match:
+                # If we're in a class, add the function with proper indentation
+                result_lines.append(line.rstrip())
+                result_lines.append('    ' + ' ' * current_indent + 'pass')
+                in_function = True
+                function_indent = current_indent
+                continue
+
+            # Detect imports
+            if stripped.startswith(('import ', 'from ')):
+                result_lines.append(line.rstrip())
+                in_function = False
+                continue
+
+            # Detect module-level constants/docstrings
+            if current_indent == 0 and stripped and not stripped.startswith('#'):
+                # Keep module-level statements
+                if '=' in stripped and not stripped.startswith('def '):
+                    result_lines.append(line.rstrip())
+                elif stripped.startswith(('"""', "'''")):
+                    # Keep single-line docstrings
+                    if stripped.count('"""') == 2 or stripped.count("'''") == 2:
+                        result_lines.append(line.rstrip())
+                in_function = False
+
+            # Handle dedentation - exiting function/class scope
+            if in_function and current_indent <= function_indent and stripped:
+                in_function = False
+                if current_indent <= class_indent and in_class:
+                    # Still in class but exiting method
+                    pass
+                else:
+                    result_lines.append(line.rstrip())
+            elif in_class and current_indent <= class_indent and stripped:
+                in_class = False
+                in_function = False
+                result_lines.append(line.rstrip())
+            elif stripped and not (in_function and current_indent > function_indent):
+                # Keep non-indented content and content not in function bodies
+                result_lines.append(line.rstrip())
+
+        return result_lines
+
+    def _extract_ts_js_skeleton_regex(self, lines: List[str], lang: str) -> List[str]:
+        """Extract TypeScript/JavaScript skeleton with interface/type support."""
+        result_lines = []
+        brace_depth = 0
+        in_interface = False
+        in_type = False
+        in_class = False
+        in_function = False
+
+        for line in lines:
+            stripped = line.strip()
+            current_indent = len(line) - len(stripped)
+
+            # Skip empty lines at the top
+            if not stripped and not result_lines:
+                continue
+
+            # Track brace depth
+            open_braces = line.count('{')
+            close_braces = line.count('}')
+            brace_depth += open_braces - close_braces
+
+            # Detect interface declarations
+            if re.match(r'^(export\s+)?(interface|type)\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                if '{' in line:
+                    # Single line interface or start of multiline
+                    if line.strip().endswith('{'):
+                        in_interface = True
+                    else:
+                        result_lines.append('    {}')
+                else:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect class declarations
+            if re.match(r'^(export\s+)?(class|abstract\s+class)\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                in_class = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect function declarations
+            if re.match(r'^(export\s+)?(async\s+)?function\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                in_function = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect arrow functions assigned to constants/vars
+            if re.match(r'^(export\s+)?(const|let|var)\s+\w+\s*=.*=>', stripped):
+                result_lines.append(line.rstrip())
+                if '{' not in line and not line.rstrip().endswith(';'):
+                    result_lines.append('    {}')
+                continue
+
+            # Detect method definitions in classes
+            if in_class and re.match(r'^(public\s+|private\s+|protected\s+)?(static\s+)?(async\s+)?\w+\s*\(', stripped):
+                result_lines.append(line.rstrip())
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Keep top-level imports and exports
+            if current_indent == 0 and (stripped.startswith('import ') or 
+                                         stripped.startswith('export ') or
+                                         stripped.startswith('from ')):
+                result_lines.append(line.rstrip())
+                continue
+
+            # Keep type/interface body content (the actual type definitions)
+            if in_interface and brace_depth >= 1:
+                # Keep the property signatures but remove complex implementations
+                if not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+                continue
+
+            # Keep top-level declarations and close braces
+            if brace_depth <= 1 and stripped:
+                if not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+
+            # Reset flags when we close braces
+            if close_braces > 0:
+                if brace_depth == 0:
+                    in_interface = False
+                    in_class = False
+                    in_function = False
+
+        return result_lines
+
+    def _extract_rust_skeleton_regex(self, lines: List[str]) -> List[str]:
+        """Extract Rust skeleton with trait, impl, struct, and enum support."""
+        result_lines = []
+        brace_depth = 0
+        in_trait = False
+        in_impl = False
+        in_struct = False
+        in_enum = False
+        in_function = False
+
+        for line in lines:
+            stripped = line.strip()
+            current_indent = len(line) - len(stripped)
+
+            # Skip empty lines at the top
+            if not stripped and not result_lines:
+                continue
+
+            # Track brace depth
+            open_braces = line.count('{')
+            close_braces = line.count('}')
+            brace_depth += open_braces - close_braces
+
+            # Detect trait definitions
+            if re.match(r'^(pub\s+)?trait\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                in_trait = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect impl blocks
+            if re.match(r'^(pub\s+)?impl\s+', stripped):
+                result_lines.append(line.rstrip())
+                in_impl = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect struct definitions
+            if re.match(r'^(pub\s+)?struct\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                in_struct = True
+                # Structs can be tuple-style, named fields, or unit structs
+                if ';' in line:
+                    # Tuple struct or unit struct
+                    pass
+                elif '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect enum definitions
+            if re.match(r'^(pub\s+)?enum\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                in_enum = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect function definitions
+            if re.match(r'^(pub\s+)?(async\s+)?fn\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                in_function = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Keep trait/impl method signatures
+            if (in_trait or in_impl) and re.match(r'^(pub\s+)?(async\s+)?fn\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                if '{' not in line and ';' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Keep enum variants
+            if in_enum and brace_depth >= 1:
+                if stripped and not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+                continue
+
+            # Keep top-level use statements and attributes
+            if current_indent == 0 and (stripped.startswith('use ') or 
+                                         stripped.startswith('#[') or
+                                         stripped.startswith('//!') or
+                                         stripped.startswith('///')):
+                result_lines.append(line.rstrip())
+                continue
+
+            # Keep struct field definitions
+            if in_struct and brace_depth >= 1:
+                if stripped and not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+                continue
+
+            # Keep top-level items and close braces
+            if brace_depth <= 1 and stripped:
+                if not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+
+            # Reset flags when we close braces
+            if close_braces > 0 and brace_depth == 0:
+                in_trait = False
+                in_impl = False
+                in_struct = False
+                in_enum = False
+                in_function = False
+
+        return result_lines
+
+    def _extract_go_skeleton_regex(self, lines: List[str]) -> List[str]:
+        """Extract Go skeleton with interface and struct support."""
+        result_lines = []
+        brace_depth = 0
+        in_interface = False
+        in_struct = False
+        in_function = False
+
+        for line in lines:
+            stripped = line.strip()
+            current_indent = len(line) - len(stripped)
+
+            # Skip empty lines at the top
+            if not stripped and not result_lines:
+                continue
+
+            # Track brace depth
+            open_braces = line.count('{')
+            close_braces = line.count('}')
+            brace_depth += open_braces - close_braces
+
+            # Detect interface definitions
+            if re.match(r'^type\s+\w+\s+interface', stripped):
+                result_lines.append(line.rstrip())
+                in_interface = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect struct definitions
+            if re.match(r'^type\s+\w+\s+struct', stripped):
+                result_lines.append(line.rstrip())
+                in_struct = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect function definitions
+            if re.match(r'^func\s+(\([^)]+\)\s+)?\w+\(', stripped):
+                result_lines.append(line.rstrip())
+                in_function = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Keep interface method signatures
+            if in_interface and brace_depth >= 1:
+                if stripped and not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+                continue
+
+            # Keep struct field definitions
+            if in_struct and brace_depth >= 1:
+                if stripped and not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+                continue
+
+            # Keep top-level imports and package declarations
+            if current_indent == 0 and (stripped.startswith('package ') or 
+                                         stripped.startswith('import ')):
+                result_lines.append(line.rstrip())
+                continue
+
+            # Keep top-level items
+            if brace_depth <= 1 and stripped:
+                if not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+
+            # Reset flags when we close braces
+            if close_braces > 0 and brace_depth == 0:
+                in_interface = False
+                in_struct = False
+                in_function = False
+
+        return result_lines
+
+    def _extract_c_style_skeleton_regex(self, lines: List[str], lang: str) -> List[str]:
+        """Extract skeleton for C-style languages (Java, C++, C#, Kotlin, Scala)."""
+        result_lines = []
+        brace_depth = 0
+        in_class = False
+        in_interface = False
+        in_function = False
+
+        for line in lines:
+            stripped = line.strip()
+            current_indent = len(line) - len(stripped)
+
+            # Skip empty lines at the top
+            if not stripped and not result_lines:
+                continue
+
+            # Track brace depth
+            open_braces = line.count('{')
+            close_braces = line.count('}')
+            brace_depth += open_braces - close_braces
+
+            # Detect class definitions
+            if re.match(r'^(public\s+|private\s+|protected\s+)?(abstract\s+)?(final\s+)?class\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                in_class = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect interface definitions
+            if re.match(r'^(public\s+)?interface\s+\w+', stripped):
+                result_lines.append(line.rstrip())
+                in_interface = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Detect method/function definitions
+            method_patterns = [
+                r'^(public\s+|private\s+|protected\s+)?(static\s+)?(final\s+)?\w+\s+\w+\s*\(',
+                r'^(public\s+|private\s+|protected\s+)?(static\s+)?void\s+\w+\s*\(',
+                r'@(Override|Deprecated|SuppressWarnings)',  # Annotations
+            ]
+            if any(re.match(p, stripped) for p in method_patterns):
+                result_lines.append(line.rstrip())
+                in_function = True
+                if '{' not in line:
+                    result_lines.append('    {}')
+                continue
+
+            # Keep imports and package declarations
+            if current_indent == 0 and (stripped.startswith('import ') or 
+                                         stripped.startswith('package ') or
+                                         stripped.startswith('using ') or
+                                         stripped.startswith('namespace ')):
+                result_lines.append(line.rstrip())
+                continue
+
+            # Keep class/interface body content (field declarations, etc.)
+            if (in_class or in_interface) and brace_depth >= 1:
+                if stripped and not stripped.startswith('//'):
+                    # Keep field declarations but not full method bodies
+                    if '{' not in stripped or stripped.startswith('//'):
+                        result_lines.append(line.rstrip())
+                continue
+
+            # Keep top-level items
+            if brace_depth <= 1 and stripped:
+                if not stripped.startswith('//'):
+                    result_lines.append(line.rstrip())
+
+            # Reset flags when we close braces
+            if close_braces > 0 and brace_depth == 0:
+                in_class = False
+                in_interface = False
+                in_function = False
+
+        return result_lines
 
     def _clean_content_chunk(self, chunk: str) -> str:
         """
@@ -1484,6 +2000,7 @@ class RepoProcessor:
         4. Only as last resort, exclude files based on depth
 
         If focus_dir is set, files in that directory get priority treatment.
+        If diff_branch is set, changed files get full treatment, others get skeletonized.
 
         Args:
             files: List of (path, rel_path) tuples
@@ -1491,8 +2008,12 @@ class RepoProcessor:
         Returns:
             Dict with processing instructions for each file
         """
-        if not self.max_tokens:
-            # No budget constraint - process all files normally
+        # Get changed files if in diff mode
+        changed_files = self._get_changed_files()
+        in_diff_mode = bool(changed_files)
+
+        if not self.max_tokens and not in_diff_mode:
+            # No budget constraint and not in diff mode - process all files normally
             # But still apply focus_dir logic if set
             if self.focus_dir:
                 return {
@@ -1513,10 +2034,11 @@ class RepoProcessor:
             except (OSError, PermissionError):
                 est_tokens = 0
 
-            # Check if priority file or in focus directory
+            # Check if priority file, in focus directory, or changed (diff mode)
             is_priority = (rel_path in PRIORITY_FILES or
                           Path(rel_path).name in PRIORITY_FILES)
             in_focus = self._is_in_focus_dir(rel_path)
+            is_changed = rel_path in changed_files
 
             # Calculate depth (deeper files are less important)
             depth = len(Path(rel_path).parts)
@@ -1527,27 +2049,48 @@ class RepoProcessor:
                 'est_tokens': est_tokens,
                 'is_priority': is_priority,
                 'in_focus': in_focus,
+                'is_changed': is_changed,
                 'depth': depth,
             })
 
-        # Sort by priority (focus/priority files first, then by depth)
-        file_estimates.sort(key=lambda x: (not x['in_focus'], not x['is_priority'], x['depth']))
+        # Sort by priority (changed/focus/priority files first, then by depth)
+        # In diff mode: changed files come first, then priority files, then others
+        if in_diff_mode:
+            file_estimates.sort(key=lambda x: (
+                not x['is_changed'],  # Changed files first
+                not x['in_focus'],    # Then focus directory
+                not x['is_priority'], # Then priority files
+                x['depth']            # Then by depth
+            ))
+        else:
+            file_estimates.sort(key=lambda x: (
+                not x['in_focus'],    # Focus directory first
+                not x['is_priority'], # Then priority files
+                x['depth']            # Then by depth
+            ))
 
         # Second pass: determine action for each file
         result = {}
         running_total = 0
-        budget_remaining = self.max_tokens
+        budget_remaining = self.max_tokens if self.max_tokens else float('inf')
 
         # Reserve 10% of budget for delimiters and tree
-        budget_remaining = int(budget_remaining * 0.9)
+        if self.max_tokens:
+            budget_remaining = int(budget_remaining * 0.9)
 
         for file_info in file_estimates:
             rel_path = file_info['rel_path']
             est_tokens = file_info['est_tokens']
             is_priority = file_info['is_priority']
             in_focus = file_info['in_focus']
+            is_changed = file_info['is_changed']
 
-            # Focus directory files get full treatment always
+            # Changed files (diff mode) and focus directory files get full treatment always
+            if is_changed:
+                result[rel_path] = {'action': 'full', 'path': file_info['path'], 'is_changed': True}
+                running_total += est_tokens
+                continue
+
             if in_focus:
                 result[rel_path] = {'action': 'focus', 'path': file_info['path']}
                 running_total += est_tokens
@@ -1569,6 +2112,10 @@ class RepoProcessor:
                 # Priority file - include anyway, even if over budget
                 result[rel_path] = {'action': 'full', 'path': file_info['path']}
                 running_total += est_tokens
+            elif in_diff_mode and not is_changed:
+                # In diff mode, non-changed files get skeletonized as context
+                result[rel_path] = {'action': 'skeleton', 'path': file_info['path']}
+                running_total += est_tokens // 5
             # else: exclude file (don't add to result)
 
         return result
@@ -1593,6 +2140,214 @@ class RepoProcessor:
         # Check if file is in focus directory or is the focus directory itself
         return (rel_path_normalized.startswith(focus_normalized + '/') or
                 rel_path_normalized == focus_normalized)
+
+    def _get_changed_files(self) -> Set[str]:
+        """
+        Get list of files changed between current state and a branch/staged area.
+
+        Returns:
+            Set of relative file paths that have changed
+        """
+        if not self.diff_branch and not self.diff_staged:
+            return set()
+
+        try:
+            # Verify git is available
+            result = subprocess.run(
+                ['git', '--version'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=str(self.repo_path)
+            )
+            if result.returncode != 0:
+                logger.warning("Git not available. Ignoring diff mode.")
+                return set()
+
+            # Get changed files
+            if self.diff_staged:
+                # Compare staged changes
+                cmd = ['git', 'diff', '--cached', '--name-only', 'HEAD']
+            elif self.diff_branch:
+                # Compare against branch
+                cmd = ['git', 'diff', '--name-only', self.diff_branch, 'HEAD']
+            else:
+                return set()
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=str(self.repo_path)
+            )
+
+            if result.returncode != 0:
+                logger.warning(f"git diff failed: {result.stderr}")
+                return set()
+
+            changed_files = set()
+            for line in result.stdout.strip().split('\n'):
+                if line.strip():
+                    changed_files.add(line.strip())
+
+            if self.verbose:
+                logger.info(f"Found {len(changed_files)} changed files")
+
+            return changed_files
+
+        except (subprocess.TimeoutExpired, Exception) as e:
+            if self.verbose:
+                logger.warning(f"Failed to get changed files: {e}")
+            return set()
+
+    def _extract_imports(self, content: str, lang: str) -> Set[str]:
+        """
+        Extract import statements from source code to identify dependencies.
+
+        Args:
+            content: Source code content
+            lang: Language identifier
+
+        Returns:
+            Set of relative module paths that are imported
+        """
+        imports = set()
+        lines = content.splitlines()
+
+        if lang == 'python':
+            for line in lines:
+                stripped = line.strip()
+                # Match: import foo, import foo.bar, from foo import x, from foo.bar import x
+                match = re.match(r'^(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))', stripped)
+                if match:
+                    module = match.group(1) or match.group(2)
+                    if module:
+                        # Convert module path to file path
+                        module_path = module.replace('.', '/')
+                        # Try different extensions
+                        for ext in ['.py', '/__init__.py']:
+                            imports.add(module_path + ext)
+                        # Also try without extension (will match in file list)
+                        imports.add(module_path)
+
+        elif lang in ('javascript', 'typescript'):
+            for line in lines:
+                stripped = line.strip()
+                # Match: import x from 'foo', import { x } from 'foo', require('foo')
+                match = re.match(r'^(?:import\s+.*?\s+from\s+|require\(\s*)[\'"]([./][\w./-]+)[\'"]', stripped)
+                if match:
+                    module = match.group(1)
+                    if module.startswith('./') or module.startswith('../'):
+                        # Relative import - likely a local file
+                        for ext in ['.ts', '.tsx', '.js', '.jsx', '']:
+                            imports.add(module + ext)
+
+        elif lang == 'rust':
+            for line in lines:
+                stripped = line.strip()
+                # Match: use foo::bar, mod foo;
+                if stripped.startswith('use '):
+                    match = re.match(r'^use\s+([\w:]+)', stripped)
+                    if match:
+                        module = match.group(1)
+                        module_path = module.replace('::', '/')
+                        imports.add(module_path + '.rs')
+                elif stripped.startswith('mod '):
+                    match = re.match(r'^mod\s+(\w+)', stripped)
+                    if match:
+                        module = match.group(1)
+                        imports.add(module + '.rs')
+
+        elif lang == 'go':
+            for line in lines:
+                stripped = line.strip()
+                # Match: import "foo" or import ( "foo" )
+                match = re.match(r'^import\s+(?:\(\s*)?"([^"]+)"', stripped)
+                if match:
+                    module = match.group(1)
+                    # Go imports are usually full paths, we only care about relative ones
+                    if module.startswith('./') or module.startswith('../'):
+                        imports.add(module + '.go')
+
+        return imports
+
+    def _resolve_dependencies(self, files: List[Tuple[Path, str]], strategy: Dict[str, Dict]) -> Dict[str, Dict]:
+        """
+        Analyze focused/changed files and add their dependencies to the strategy.
+
+        For files in focus mode or changed mode, extract their imports and add
+        skeleton versions of those dependencies if they exist in the repo.
+
+        Args:
+            files: List of (path, rel_path) tuples
+            strategy: Current processing strategy dict
+
+        Returns:
+            Updated strategy with dependencies added
+        """
+        if not self.resolve_dependencies:
+            return strategy
+
+        # Build a map of possible module paths to file paths
+        file_map = {}
+        for path, rel_path in files:
+            file_map[rel_path] = path
+            # Also map without extension for some languages
+            if rel_path.endswith('.py'):
+                file_map[rel_path[:-3]] = path
+            elif rel_path.endswith('.ts'):
+                file_map[rel_path[:-3]] = path
+                file_map[rel_path[:-3] + '.tsx'] = path
+            elif rel_path.endswith('.js'):
+                file_map[rel_path[:-3]] = path
+                file_map[rel_path[:-3] + '.jsx'] = path
+
+        # Find files that need dependency resolution
+        files_to_analyze = []
+        for rel_path, info in strategy.items():
+            if info['action'] in ('focus', 'full') and info.get('is_changed'):
+                files_to_analyze.append(rel_path)
+
+        # Extract imports from each focused/changed file
+        all_deps = set()
+        for rel_path in files_to_analyze:
+            path = strategy[rel_path]['path']
+            try:
+                content = self._read_file_safely(path)
+                lang = get_language_from_path(rel_path)
+                imports = self._extract_imports(content, lang)
+
+                # Match imports against available files
+                for imp in imports:
+                    # Normalize import path
+                    imp_normalized = imp.lstrip('/')
+                    if imp_normalized in file_map:
+                        dep_path = file_map[imp_normalized]
+                        dep_rel = dep_path.relative_to(self.repo_path).as_posix()
+                        # Only add if it's a local file (within repo)
+                        if not dep_rel.startswith('../'):
+                            all_deps.add(dep_rel)
+            except Exception as e:
+                if self.verbose:
+                    logger.debug(f"Could not extract imports from {rel_path}: {e}")
+
+        # Add dependencies to strategy with skeleton mode
+        for dep_rel in all_deps:
+            if dep_rel not in strategy:
+                # Find the path for this dependency
+                for path, rel_path in files:
+                    if rel_path == dep_rel:
+                        strategy[dep_rel] = {
+                            'action': 'skeleton',
+                            'path': path,
+                            'is_dependency': True
+                        }
+                        if self.verbose:
+                            logger.info(f"Added dependency: {dep_rel}")
+                        break
+
+        return strategy
 
     def generate_tree_structure(self, strategy: Optional[Dict[str, Dict]] = None) -> str:
         """
@@ -1680,7 +2435,11 @@ class RepoProcessor:
                                 suffix = " [CLEANED]"
                             elif action == 'focus':
                                 suffix = " [FULL CONTEXT]"
-                        
+                            
+                            # Show changed files in diff mode
+                            if strategy[rel_entry].get('is_changed'):
+                                suffix = " [CHANGED]" + (suffix if suffix else "")
+
                         tree_lines.append(f"{prefix}{char}{entry.name}{suffix}")
             except PermissionError:
                 tree_lines.append(f"{prefix}└── [Permission Denied]")
@@ -1718,7 +2477,7 @@ class RepoProcessor:
                 if not self.dry_run:
                     outfile.write(LLM_INSTRUCTIONS)
                     if self.count_tokens:
-                        self.total_tokens += get_tiktoken_token_count(LLM_INSTRUCTIONS)
+                        self.total_tokens += get_token_count_for_model(LLM_INSTRUCTIONS, self.target_model)
 
                 # Collect all files first for token budgeting
                 all_files = list(self.get_valid_files())
@@ -1733,12 +2492,16 @@ class RepoProcessor:
                     file_strategy = {rel_path: {'action': 'full', 'path': path}
                                     for path, rel_path in all_files}
 
+                # Resolve dependencies if enabled
+                if not self.dry_run:
+                    file_strategy = self._resolve_dependencies(all_files, file_strategy)
+
                 # Write repository structure tree if requested (now with status info)
                 if self.include_tree and not self.dry_run:
                     tree_structure = self.generate_tree_structure(file_strategy)
                     outfile.write(tree_structure)
                     if self.count_tokens:
-                        self.total_tokens += get_tiktoken_token_count(tree_structure)
+                        self.total_tokens += get_token_count_for_model(tree_structure, self.target_model)
 
                 # Process files according to strategy
                 for file_path, rel_file in all_files:
@@ -1776,7 +2539,7 @@ class RepoProcessor:
                     # Write start delimiter and count tokens
                     outfile.write(start_header + "\n")
                     if self.count_tokens:
-                        self.total_tokens += get_tiktoken_token_count(start_header + "\n")
+                        self.total_tokens += get_token_count_for_model(start_header + "\n", self.target_model)
 
                     # Read and process file based on strategy
                     content = self._read_file_safely(file_path)
@@ -1784,7 +2547,7 @@ class RepoProcessor:
                         if self.verbose:
                             logger.warning(f"Skipping '{rel_file}' - {content}")
                         if self.count_tokens:
-                            self.total_tokens -= get_tiktoken_token_count(start_header + "\n")
+                            self.total_tokens -= get_token_count_for_model(start_header + "\n", self.target_model)
                         continue
 
                     # Apply processing based on strategy
@@ -1808,26 +2571,26 @@ class RepoProcessor:
 
                     # Check max_tokens before writing
                     if self.max_tokens:
-                        content_tokens = get_tiktoken_token_count(content)
+                        content_tokens = get_token_count_for_model(content, self.target_model)
                         if self.total_tokens + content_tokens > self.max_tokens:
                             logger.warning(f"Token limit reached. Stopping dump at '{rel_file}'.")
                             outfile.write("\n")
                             outfile.write(end_footer + "\n")
                             if self.count_tokens:
-                                self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
+                                self.total_tokens += get_token_count_for_model(end_footer + "\n", self.target_model)
                             processed_count += 1
                             break
 
                     # Write content
                     outfile.write(content)
                     if self.count_tokens:
-                        self.total_tokens += get_tiktoken_token_count(content)
+                        self.total_tokens += get_token_count_for_model(content, self.target_model)
 
                     # Ensure file ends with newline before end delimiter
                     outfile.write("\n")
                     outfile.write(end_footer + "\n")
                     if self.count_tokens:
-                        self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
+                        self.total_tokens += get_token_count_for_model(end_footer + "\n", self.target_model)
 
                     processed_count += 1
 
