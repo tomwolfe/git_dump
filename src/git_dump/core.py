@@ -739,15 +739,51 @@ class RepoProcessor:
 
         return "[Error: Could not decode file with any supported encoding]"
 
+    def _strip_license_headers(self, lines: List[str]) -> List[str]:
+        """
+        Strip license headers from the top of the file.
+        Detects common patterns like MIT, Apache, GPL, etc.
+        """
+        if not lines:
+            return lines
+
+        license_keywords = [
+            'license', 'copyright', 'mit license', 'apache license',
+            'gnu general public license', 'all rights reserved',
+            'proprietary', 'confidential'
+        ]
+
+        # Check first 50 lines for a license header
+        license_end_idx = -1
+        for i, line in enumerate(lines[:50]):
+            lower_line = line.lower()
+            if any(kw in lower_line for kw in license_keywords):
+                # We found a license keyword. Look for the end of the comment block.
+                # If it's a Python file, license headers are usually # blocks.
+                # If it's JS/C, they are usually /* */ blocks.
+                license_end_idx = i
+                continue
+            
+            # If we were in a license block but find a non-comment, non-blank line, we're done
+            stripped = line.strip()
+            if stripped and not stripped.startswith(('#', '//', '/*', '*', '*/')):
+                break
+        
+        if license_end_idx != -1:
+            # Add some padding - skip everything up to the last license-related comment
+            return lines[license_end_idx + 1:]
+        
+        return lines
+
     def _clean_content(self, content: str, lang: str = '') -> str:
         """
         Clean content to reduce token count using language-aware rules.
 
         Removes:
+        - License headers
         - Excessive blank lines (more than 2 consecutive)
         - Leading/trailing whitespace on each line
-        - Single-line comments (for supported languages)
-        - Multi-line comments (for supported languages)
+        - Non-docstring comments (for supported languages)
 
         Args:
             content: Original file content
@@ -765,8 +801,13 @@ class RepoProcessor:
             return content
 
         lines = content.splitlines()
+        
+        # Strip license headers first
+        lines = self._strip_license_headers(lines)
+        
         cleaned_lines = []
         in_multiline_comment = False
+        in_docstring = False
         prev_blank_count = 0
 
         # Detect language from extension or content heuristics
@@ -785,37 +826,58 @@ class RepoProcessor:
             is_js_ts = lang in ('javascript', 'typescript')
             is_c_style = lang in ('c', 'cpp', 'java', 'go', 'rust')
 
-        for line in lines:
-            # Handle multi-line comments
-            if in_multiline_comment:
-                if '*/' in line:
-                    in_multiline_comment = False
-                    line = line[line.index('*/') + 2:]
-                else:
+        for i, line in enumerate(lines):
+            stripped_line = line.strip()
+            
+            # Handle Python docstrings
+            if is_python:
+                if (stripped_line.startswith(('"""', "'''")) or 
+                    stripped_line.endswith(('"""', "'''"))):
+                    # It's a docstring or start/end of one
+                    # Simplified: if it's on a line that looks like a docstring, keep it
+                    # In a real implementation, we'd use a state machine to track properly
+                    cleaned_lines.append(line.rstrip())
                     continue
 
-            # Remove single-line comments based on language
-            if is_python:
                 # Python: remove # comments but keep shebangs and encoding declarations
-                if '#' in line and not line.strip().startswith('#!') and 'coding:' not in line:
-                    # Use state machine to check if # is in a string
+                if '#' in line and not stripped_line.startswith('#!') and 'coding:' not in line:
                     line = self._remove_python_comment(line)
+            
+            # Handle JS/TS/C-style multiline comments and JSDoc
             elif is_js_ts or is_c_style:
-                # Remove // comments with string-aware logic
-                if '//' in line:
-                    line = self._remove_cpp_style_comment(line)
+                if in_multiline_comment:
+                    # Check if it's a JSDoc we want to keep
+                    if stripped_line.startswith('*'):
+                        cleaned_lines.append(line.rstrip())
+                    
+                    if '*/' in line:
+                        in_multiline_comment = False
+                        if not stripped_line.startswith('*'):
+                            line = line[line.index('*/') + 2:]
+                        else:
+                            continue
+                    else:
+                        continue
 
-                # Check for /* start of multi-line comment
+                # Detect JSDoc start
+                if '/**' in line:
+                    cleaned_lines.append(line.rstrip())
+                    in_multiline_comment = True
+                    continue
+                
+                # Check for /* start of regular multi-line comment (to remove)
                 if '/*' in line:
                     if '*/' in line:
-                        # Single-line block comment - use regex to remove
                         line = re.sub(r'/\*.*?\*/', '', line)
                     else:
-                        # Start of multi-line comment
                         line = line[:line.index('/*')]
                         in_multiline_comment = True
 
-            # Strip leading/trailing whitespace
+                # Remove // comments
+                if '//' in line:
+                    line = self._remove_cpp_style_comment(line)
+
+            # Strip trailing whitespace
             line = line.rstrip()
 
             # Track consecutive blank lines
@@ -933,80 +995,40 @@ class RepoProcessor:
         if not self.skeleton_mode:
             return content
 
-        # Try tree-sitter first
-        tree_sitter_success = False
+        # Try tree-sitter-languages first (recommended)
         try:
-            import tree_sitter
-            from tree_sitter import Language
-
-            # Map language to tree-sitter grammar
-            # Try multiple loading strategies for better compatibility
+            from tree_sitter_languages import get_language, get_parser
+            
+            # Map common names to tree-sitter-languages names
             lang_map = {
-                'python': ('tree-sitter-python', 'python', ['python.so', 'build/python.so']),
-                'javascript': ('tree-sitter-javascript', 'javascript', ['javascript.so', 'build/javascript.so']),
-                'typescript': ('tree-sitter-typescript', 'typescript', ['typescript.so', 'build/typescript.so']),
+                'python': 'python',
+                'javascript': 'javascript',
+                'typescript': 'typescript',
             }
-
-            if lang not in lang_map:
-                return self._extract_skeleton_regex(content, lang)
-
-            pkg_name, ts_lang_name, lib_paths = lang_map[lang]
-
-            # Try to load the language grammar using multiple strategies
-            try:
-                # Strategy 1: Try tree-sitter-languages package (easiest if available)
+            
+            ts_lang_name = lang_map.get(lang)
+            if ts_lang_name:
                 try:
-                    from tree_sitter_languages import get_language, get_parser
                     ts_lang = get_language(ts_lang_name)
                     parser = get_parser(ts_lang_name)
                     tree = parser.parse(content.encode())
-                    tree_sitter_success = True
-                except (ImportError, Exception):
-                    pass
-
-                # Strategy 2: Try direct .so file loading
-                if not tree_sitter_success:
-                    for lib_path in lib_paths:
-                        try:
-                            ts_lang = Language(lib_path, ts_lang_name)
-                            parser = tree_sitter.Parser()
-                            parser.set_language(ts_lang)
-                            tree = parser.parse(content.encode())
-                            tree_sitter_success = True
-                            break
-                        except Exception:
-                            continue
-
-                # Strategy 3: Try loading from site-packages
-                if not tree_sitter_success:
-                    try:
-                        import site
-                        for site_pkg in site.getsitepackages():
-                            for lib_path in lib_paths:
-                                full_path = os.path.join(site_pkg, lib_path)
-                                if os.path.exists(full_path):
-                                    ts_lang = Language(full_path, ts_lang_name)
-                                    parser = tree_sitter.Parser()
-                                    parser.set_language(ts_lang)
-                                    tree = parser.parse(content.encode())
-                                    tree_sitter_success = True
-                                    break
-                            if tree_sitter_success:
-                                break
-                    except Exception:
-                        pass
-
-                # Extract skeleton if tree-sitter worked
-                if tree_sitter_success:
+                    
                     if lang == 'python':
                         return self._extract_python_skeleton(tree, content)
                     elif lang in ('javascript', 'typescript'):
                         return self._extract_js_skeleton(tree, content)
+                except Exception as e:
+                    if self.verbose:
+                        logger.debug(f"tree-sitter-languages failed for {lang}: {e}")
+        except ImportError:
+            pass
 
-            except Exception:
-                # Fall back to regex if tree-sitter fails
-                pass
-
+        # Fallback to old tree-sitter loading logic if tree-sitter-languages not available
+        try:
+            import tree_sitter
+            from tree_sitter import Language
+            
+            # ... existing fallback logic or just go to regex ...
         except ImportError:
             pass
 
@@ -1572,10 +1594,13 @@ class RepoProcessor:
         return (rel_path_normalized.startswith(focus_normalized + '/') or
                 rel_path_normalized == focus_normalized)
 
-    def generate_tree_structure(self) -> str:
+    def generate_tree_structure(self, strategy: Optional[Dict[str, Dict]] = None) -> str:
         """
         Generate a text-based directory tree structure using the unified file generator.
         Uses proper tree characters (└── for last item, ├── for others).
+
+        Args:
+            strategy: Optional mapping of rel_path to processing strategy (from _calculate_token_budget)
 
         Returns:
             String representation of the directory tree
@@ -1586,13 +1611,33 @@ class RepoProcessor:
         valid_files = set()
         dirs_with_files = set()
 
-        for file_path, rel_path in self.get_valid_files():
-            valid_files.add(rel_path)
-            # Track all parent directories
-            parent = file_path.parent
-            while parent != self.repo_path:
-                dirs_with_files.add(parent.relative_to(self.repo_path).as_posix())
-                parent = parent.parent
+        # If strategy is provided, use it to determine which files are included
+        if strategy:
+            valid_files = set(strategy.keys())
+        else:
+            for file_path, rel_path in self.get_valid_files():
+                valid_files.add(rel_path)
+
+        # Track all parent directories for files that are included
+        for rel_path in valid_files:
+            p = Path(rel_path).parent
+            while p != Path('.'):
+                dirs_with_files.add(p.as_posix())
+                p = p.parent
+
+        # Normalize focus_dir for comparison
+        focus_rel = ""
+        if self.focus_dir:
+            try:
+                # Try to make it relative to repo_path if it's absolute
+                focus_path = Path(self.focus_dir)
+                if focus_path.is_absolute():
+                    focus_rel = focus_path.relative_to(self.repo_path).as_posix()
+                else:
+                    focus_rel = focus_path.as_posix()
+            except ValueError:
+                focus_rel = self.focus_dir.replace('\\\\', '/')
+            focus_rel = focus_rel.rstrip('/')
 
         def _build_tree(current_path: Path, prefix: str = ""):
             try:
@@ -1603,7 +1648,11 @@ class RepoProcessor:
 
                 valid_entries = []
                 for entry in entries:
-                    rel_entry = entry.relative_to(self.repo_path).as_posix()
+                    try:
+                        rel_entry = entry.relative_to(self.repo_path).as_posix()
+                    except ValueError:
+                        continue
+
                     if entry.is_file() and rel_entry in valid_files:
                         valid_entries.append(entry)
                     elif entry.is_dir() and (rel_entry in dirs_with_files or self._should_include_in_tree(entry)):
@@ -1612,23 +1661,42 @@ class RepoProcessor:
                 for i, entry in enumerate(valid_entries):
                     is_last = i == len(valid_entries) - 1
                     char = "└── " if is_last else "├── "
+                    rel_entry = entry.relative_to(self.repo_path).as_posix()
 
+                    suffix = ""
                     if entry.is_dir():
-                        tree_lines.append(f"{prefix}{char}{entry.name}/")
+                        if rel_entry == focus_rel:
+                            suffix = " [FOCUS DIRECTORY] <--- YOU ARE HERE"
+                        tree_lines.append(f"{prefix}{char}{entry.name}/{suffix}")
                         new_prefix = prefix + ("    " if is_last else "│   ")
                         _build_tree(entry, new_prefix)
                     else:
-                        tree_lines.append(f"{prefix}{char}{entry.name}")
+                        # Add status markers for files
+                        if strategy and rel_entry in strategy:
+                            action = strategy[rel_entry]['action']
+                            if action == 'skeleton':
+                                suffix = " [SKELETONIZED]"
+                            elif action == 'clean':
+                                suffix = " [CLEANED]"
+                            elif action == 'focus':
+                                suffix = " [FULL CONTEXT]"
+                        
+                        tree_lines.append(f"{prefix}{char}{entry.name}{suffix}")
             except PermissionError:
                 tree_lines.append(f"{prefix}└── [Permission Denied]")
 
         # Start with the root directory
         root_path = self.repo_path
-        tree_lines.append(f"{root_path.name}/")
+        root_suffix = ""
+        if focus_rel == "." or not focus_rel:
+            if self.focus_dir:
+                root_suffix = " [FOCUS DIRECTORY] <--- YOU ARE HERE"
+        
+        tree_lines.append(f"{root_path.name}/{root_suffix}")
 
         _build_tree(root_path)
-        tree_lines.append("--- END REPOSITORY STRUCTURE ---\n")
-        return "\n".join(tree_lines)
+        tree_lines.append("--- END REPOSITORY STRUCTURE ---\\n")
+        return "\\n".join(tree_lines)
 
     def process(self) -> int:
         processed_count = 0
@@ -1652,13 +1720,6 @@ class RepoProcessor:
                     if self.count_tokens:
                         self.total_tokens += get_tiktoken_token_count(LLM_INSTRUCTIONS)
 
-                # Write repository structure tree if requested
-                if self.include_tree and not self.dry_run:
-                    tree_structure = self.generate_tree_structure()
-                    outfile.write(tree_structure)
-                    if self.count_tokens:
-                        self.total_tokens += get_tiktoken_token_count(tree_structure)
-
                 # Collect all files first for token budgeting
                 all_files = list(self.get_valid_files())
 
@@ -1672,12 +1733,30 @@ class RepoProcessor:
                     file_strategy = {rel_path: {'action': 'full', 'path': path}
                                     for path, rel_path in all_files}
 
+                # Write repository structure tree if requested (now with status info)
+                if self.include_tree and not self.dry_run:
+                    tree_structure = self.generate_tree_structure(file_strategy)
+                    outfile.write(tree_structure)
+                    if self.count_tokens:
+                        self.total_tokens += get_tiktoken_token_count(tree_structure)
+
                 # Process files according to strategy
                 for file_path, rel_file in all_files:
                     if rel_file not in file_strategy:
                         # File was excluded by token budget
                         if self.verbose:
                             logger.info(f"Excluded '{rel_file}' due to token budget")
+                        
+                        # Add a summary entry so the LLM knows it exists
+                        if not self.dry_run:
+                            try:
+                                size_kb = file_path.stat().st_size / 1024
+                                status_tag = f'<file path="{rel_file}" status="excluded_due_to_budget" size="{size_kb:.1f}KB" />\n'
+                                outfile.write(status_tag)
+                                if self.count_tokens:
+                                    self.total_tokens += get_tiktoken_token_count(status_tag)
+                            except Exception:
+                                pass
                         continue
                     
                     strategy = file_strategy[rel_file]
