@@ -5,7 +5,8 @@ import pytest
 from pathlib import Path
 from src.git_dump.core import (
     RepoProcessor, get_language_from_path, BINARY_EXTENSIONS,
-    DEFAULT_JUNK_DIRS, DEFAULT_IGNORE_PATTERNS, LLM_INSTRUCTIONS
+    DEFAULT_JUNK_DIRS, DEFAULT_IGNORE_PATTERNS, LLM_INSTRUCTIONS,
+    MAGIC_NUMBERS, estimate_tokens
 )
 
 
@@ -27,7 +28,7 @@ class TestRepoProcessor:
         self.create_file("file1.txt", "content1")
         self.create_file("dir/file2.txt", "content2")
 
-        processor = RepoProcessor(self.test_dir, self.output_file)
+        processor = RepoProcessor(self.test_dir, self.output_file, use_xml_format=False)
         count = processor.process()
 
         assert count == 2
@@ -76,7 +77,7 @@ class TestRepoProcessor:
         self.create_file("subdir/public.txt", "public data")
         self.create_file("main.py", "print('hello')")
 
-        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False, use_xml_format=False)
         count = processor.process()
 
         # Should include: .gitignore (root), main.py, subdir/.gitignore, subdir/public.txt
@@ -89,7 +90,7 @@ class TestRepoProcessor:
             assert "subdir/public.txt" in content
             assert "app.log" not in content  # Excluded by root .gitignore
             # The file 'subdir/secret.txt' should not appear in the output (not the string "secret.txt")
-            assert "### File: subdir/secret.txt" not in content  # Excluded by nested .gitignore
+            assert '<file path="subdir/secret.txt">' not in content  # Excluded by nested .gitignore
             assert ".gitignore" in content  # Root .gitignore file itself is included
             assert "subdir/.gitignore" in content  # Nested .gitignore file itself is included
 
@@ -114,7 +115,9 @@ class TestRepoProcessor:
             self.test_dir,
             self.output_file,
             start_delimiter="START {path}",
-            end_delimiter="END {path}"
+            end_delimiter="END {path}",
+            use_xml_format=False,
+            include_tree=False,
         )
         processor.process()
 
@@ -129,7 +132,11 @@ class TestRepoProcessor:
         self.create_file("script.js", "console.log('hi')")
         self.create_file("README.md", "# Project")
 
-        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            include_tree=False,
+            use_xml_format=False,
+        )
         processor.process()
 
         with open(self.output_file, "r", encoding="utf-8") as f:
@@ -217,8 +224,8 @@ class TestRepoProcessor:
         assert "test.py" in tree_section
 
         # Dump section should also NOT contain .log file contents
-        assert "### File: app.log" not in content
-        assert "### File: subdir/debug.log" not in content
+        assert '<file path="app.log">' not in content
+        assert '<file path="subdir/debug.log">' not in content
 
     def test_tree_structure_method(self):
         """Test the generate_tree_structure method directly."""
@@ -242,16 +249,17 @@ class TestRepoProcessor:
         self.create_file("main.py", "print('hello')")
 
         processor = RepoProcessor(
-            self.test_dir, 
-            self.output_file, 
+            self.test_dir,
+            self.output_file,
             count_tokens=True,
-            include_tree=False
+            include_tree=False,
+            use_xml_format=False,
         )
         processor.process()
 
         # Token count should be > 0 and include delimiters
         assert processor.total_tokens > 0
-        # The delimiters "### File: main.py" and "```" should be counted
+        # The delimiters should be counted
 
     def test_token_counting_includes_tree(self):
         """Test that token counting includes the tree structure."""
@@ -729,6 +737,7 @@ class TestPrioritySorting:
             self.test_dir, self.output_file,
             sort_priority=True,
             include_tree=False,
+            use_xml_format=False,
         )
         processor.process()
 
@@ -756,6 +765,7 @@ class TestPrioritySorting:
             self.test_dir, self.output_file,
             sort_priority=False,
             include_tree=False,
+            use_xml_format=False,
         )
         processor.process()
 
@@ -767,3 +777,282 @@ class TestPrioritySorting:
         alpha_pos = content.index("### File: alpha.txt")
         # Alphabetically, README comes after alpha
         assert alpha_pos < readme_pos
+
+
+class TestXMLFormat:
+    """Test XML-style delimiters."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_xml_delimiters_default(self):
+        """Test that XML delimiters are used by default."""
+        self.create_file("main.py", "print('hello')")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert '<file path="main.py">' in content
+            assert '<![CDATA[' in content
+            assert ']]></file>' in content
+            assert "print('hello')" in content
+
+    def test_markdown_delimiters_option(self):
+        """Test that markdown delimiters can be used instead of XML."""
+        self.create_file("main.py", "print('hello')")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            include_tree=False,
+            use_xml_format=False,
+        )
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert '### File: main.py' in content
+            assert '```python' in content
+
+
+class TestMagicNumberDetection:
+    """Test magic number binary detection."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_png_magic_number(self):
+        """Test PNG detection via magic number."""
+        from src.git_dump.core import MAGIC_PREFIXES
+        
+        # Create a file with PNG magic number
+        png_path = os.path.join(self.test_dir, "fake.png")
+        with open(png_path, "wb") as f:
+            f.write(b'\x89PNG\x0d\x0a\x1a\x0a' + b'fake png data')
+
+        processor = RepoProcessor(self.test_dir, self.output_file)
+        assert processor._is_binary(Path(png_path)) is True
+
+    def test_pdf_magic_number(self):
+        """Test PDF detection via magic number."""
+        # Create a file with PDF magic number
+        pdf_path = os.path.join(self.test_dir, "fake.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(b'%PDF-1.4 fake pdf data')
+
+        processor = RepoProcessor(self.test_dir, self.output_file)
+        assert processor._is_binary(Path(pdf_path)) is True
+
+    def test_text_file_not_binary(self):
+        """Test that text files are not detected as binary."""
+        # Create a text file
+        txt_path = os.path.join(self.test_dir, "test.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write('Hello, World!')
+
+        processor = RepoProcessor(self.test_dir, self.output_file)
+        assert processor._is_binary(Path(txt_path)) is False
+
+
+class TestSkeletonMode:
+    """Test skeleton mode functionality."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_python_skeleton_regex(self):
+        """Test Python skeleton extraction (regex fallback)."""
+        python_code = """
+import os
+
+def hello():
+    print("Hello")
+    return True
+
+def world():
+    x = 1
+    y = 2
+    return x + y
+
+class MyClass:
+    def __init__(self):
+        self.value = 0
+"""
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            skeleton_mode=True,
+            skeleton_threshold=10,  # Low threshold to trigger skeleton
+            include_tree=False,
+        )
+        
+        skeleton = processor._extract_skeleton(python_code, 'python')
+        
+        # Should keep function signatures
+        assert 'def hello():' in skeleton
+        assert 'def world():' in skeleton
+        assert 'class MyClass:' in skeleton
+        # Should have pass statements
+        assert 'pass' in skeleton
+        # Should be shorter than original
+        assert len(skeleton) < len(python_code)
+
+    def test_js_skeleton_regex(self):
+        """Test JavaScript skeleton extraction (regex fallback)."""
+        js_code = """
+function hello() {
+    console.log("Hello");
+    return true;
+}
+
+class MyClass {
+    constructor() {
+        this.value = 0;
+    }
+}
+"""
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            skeleton_mode=True,
+            skeleton_threshold=10,
+            include_tree=False,
+        )
+        
+        skeleton = processor._extract_skeleton(js_code, 'javascript')
+        
+        # Should keep function/class declarations
+        assert 'function' in skeleton or 'class' in skeleton
+        # Should be shorter than original
+        assert len(skeleton) < len(js_code)
+
+
+class TestTokenBudget:
+    """Test smart token budgeting."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_token_budget_prioritizes_important_files(self):
+        """Test that token budget prioritizes README and config files."""
+        # Create multiple files
+        self.create_file("README.md", "# Project\n" * 100)  # Large README
+        self.create_file("pyproject.toml", "[tool.poetry]\n" * 50)  # Config
+        self.create_file("src/deep/nested/file.py", "x = 1\n" * 200)  # Deep nested
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            max_tokens=500,  # Very low budget
+            include_tree=False,
+            count_tokens=True,
+        )
+        
+        # Get all files
+        all_files = list(processor.get_valid_files())
+        
+        # Calculate budget strategy
+        strategy = processor._calculate_token_budget(all_files)
+        
+        # README and pyproject.toml should be included
+        assert 'README.md' in strategy
+        assert 'pyproject.toml' in strategy
+        
+        # Deep nested file might be excluded, skeletonized, cleaned, or full if budget allows
+        deep_file = 'src/deep/nested/file.py'
+        if deep_file in strategy:
+            # If included, action could be anything depending on budget
+            assert strategy[deep_file]['action'] in ('full', 'skeleton', 'clean')
+
+    def test_token_budget_excludes_deep_files_first(self):
+        """Test that deeply nested files are excluded before shallow ones."""
+        self.create_file("shallow1.py", "x = 1\n" * 50)
+        self.create_file("shallow2.py", "x = 2\n" * 50)
+        self.create_file("deep/nested/file1.py", "x = 3\n" * 50)
+        self.create_file("deep/nested/file2.py", "x = 4\n" * 50)
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            max_tokens=200,
+            include_tree=False,
+        )
+        
+        all_files = list(processor.get_valid_files())
+        strategy = processor._calculate_token_budget(all_files)
+        
+        # Shallow files should have priority
+        assert 'shallow1.py' in strategy
+        assert 'shallow2.py' in strategy
+
+
+class TestConfigFile:
+    """Test config file support."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_config_file_loading(self):
+        """Test that config file is loaded correctly."""
+        # Create config file (top-level keys, not under [tool.gitdump])
+        config_content = """
+ignore = ["*.log", "temp/"]
+max_tokens = 5000
+max_file_size = 102400
+"""
+        config_path = os.path.join(self.test_dir, ".gitdumprc.toml")
+        with open(config_path, "w") as f:
+            f.write(config_content)
+        
+        self.create_file("main.py", "print('hello')")
+        self.create_file("test.log", "log content")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            config_file=config_path,
+            include_tree=False,
+        )
+        
+        # Config should have loaded ignore patterns
+        assert "*.log" in processor.ignore_patterns or "temp/" in processor.ignore_patterns

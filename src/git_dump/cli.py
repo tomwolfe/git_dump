@@ -4,6 +4,7 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
 from .core import RepoProcessor, get_tiktoken_token_count
 
 
@@ -13,6 +14,21 @@ def setup_logging(verbose: bool):
         level=level,
         format='%(levelname)s: %(message)s'
     )
+
+
+def find_config_file(repo_path: str) -> str:
+    """Look for config file in repository root."""
+    repo = Path(repo_path)
+    
+    # Check for .gitdumprc.toml
+    config_names = ['.gitdumprc.toml', '.gitdump.toml', 'gitdump.toml']
+    
+    for name in config_names:
+        config_path = repo / name
+        if config_path.exists():
+            return str(config_path)
+    
+    return None
 
 
 def main():
@@ -37,13 +53,19 @@ def main():
     )
     parser.add_argument(
         "--start-delimiter",
-        default="### File: {path}\n```{lang}",
-        help="Custom start delimiter (use {path} and {lang} placeholders)"
+        default=None,
+        help="Custom start delimiter (use {path} and {lang} placeholders). Default: XML format"
     )
     parser.add_argument(
         "--end-delimiter",
-        default="```",
-        help="Custom end delimiter"
+        default=None,
+        help="Custom end delimiter. Default: XML format"
+    )
+    parser.add_argument(
+        "--no-xml",
+        action="store_false",
+        dest="use_xml",
+        help="Use markdown delimiters instead of XML format"
     )
     parser.add_argument(
         "-q", "--quiet", action="store_false", dest="verbose", help="Quiet mode"
@@ -66,11 +88,19 @@ def main():
     )
     parser.add_argument(
         "--max-tokens", type=int, default=None,
-        help="Maximum token count limit. Stops processing when reached (requires tiktoken for accurate counting)"
+        help="Maximum token count limit. Uses smart budgeting to fit content (requires tiktoken for accurate counting)"
     )
     parser.add_argument(
         "--clean", action="store_true", dest="clean_mode",
         help="Clean files by removing comments and excessive whitespace to reduce token count"
+    )
+    parser.add_argument(
+        "--skeleton", action="store_true", dest="skeleton_mode",
+        help="Use skeleton mode for large files (extract only function/class signatures using tree-sitter)"
+    )
+    parser.add_argument(
+        "--skeleton-threshold", type=int, default=1000,
+        help="Token threshold for skeleton mode (default: 1000 tokens)"
     )
     parser.add_argument(
         "--no-sort", action="store_false", dest="sort_priority",
@@ -84,6 +114,14 @@ def main():
         "--commit", type=str, default=None,
         help="Git commit hash to dump (uses git worktree temporarily)"
     )
+    parser.add_argument(
+        "--git", action="store_true", dest="use_git_ls_files",
+        help="Use git ls-files for faster traversal (only works in git repositories)"
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to config file (default: looks for .gitdumprc.toml in repo root)"
+    )
 
     args = parser.parse_args()
 
@@ -92,6 +130,13 @@ def main():
         sys.exit(1)
 
     setup_logging(args.verbose)
+
+    # Find config file if not specified
+    config_path = args.config
+    if not config_path:
+        config_path = find_config_file(args.repo_path)
+        if config_path and args.verbose:
+            print(f"Using config file: {config_path}")
 
     processor = RepoProcessor(
         args.repo_path,
@@ -112,6 +157,11 @@ def main():
         sort_priority=args.sort_priority,
         git_branch=args.branch,
         git_commit=args.commit,
+        use_xml_format=args.use_xml,
+        use_git_ls_files=args.use_git_ls_files,
+        skeleton_mode=args.skeleton_mode,
+        skeleton_threshold=args.skeleton_threshold,
+        config_file=config_path,
     )
 
     if args.verbose:

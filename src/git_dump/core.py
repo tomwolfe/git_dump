@@ -34,6 +34,43 @@ BINARY_EXTENSIONS: Set[str] = {
     '.key', '.numbers', '.pages',
 }
 
+# Magic number signatures for common binary formats
+# These are the first few bytes of files that indicate binary content
+MAGIC_NUMBERS: Dict[bytes, str] = {
+    b'\x89PNG': 'PNG image',
+    b'\xff\xd8\xff': 'JPEG image',
+    b'GIF87a': 'GIF image',
+    b'GIF89a': 'GIF image',
+    b'\x89HDF': 'HDF5 file',
+    b'\x80HDF': 'HDF5 file (big endian)',
+    b'PK\x03\x04': 'ZIP archive',
+    b'PK\x05\x06': 'ZIP archive (empty)',
+    b'PK\x07\x08': 'ZIP archive (spanned)',
+    b'\x1f\x8b': 'GZIP compressed',
+    b'BZh': 'BZIP2 compressed',
+    b'\xfd7zXZ\x00': 'XZ compressed',
+    b'\x04\x22\x4d\x18': 'LZ4 compressed',
+    b'\x28\xb5\x2f\xfd': 'ZSTD compressed',
+    b'%PDF': 'PDF document',
+    b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1': 'Microsoft Office (OLE)',
+    b'\x50\x4b\x03\x04': 'Office Open XML (docx, xlsx, pptx)',
+    b'\x00\x00\x00': 'Binary data (null bytes)',
+    b'\x7fELF': 'ELF executable',
+    b'MZ': 'DOS/Windows executable',
+    b'\xca\xfe\xba\xbe': 'Java class / Mach-O fat binary',
+    b'\xcf\xfa\xed\xfe': 'Mach-O binary (little endian)',
+    b'\xfe\xed\xfa\xcf': 'Mach-O binary (big endian)',
+    b'\x52\x49\x46\x46': 'RIFF format (WAV, AVI, WEBP)',
+    b'OggS': 'OGG Vorbis',
+    b'fLaC': 'FLAC audio',
+    b'\x1a\x45\xdf\xa3': 'Matroska (MKV)',
+    b'SQLite format 3\x00': 'SQLite database',
+    b'\x00\x00\x00\x01': 'Apple resource fork',
+}
+
+# Magic number prefixes to check (sorted by length for efficient checking)
+MAGIC_PREFIXES = sorted(MAGIC_NUMBERS.keys(), key=len, reverse=True)
+
 # Default junk directories to ignore even if no .gitignore exists
 DEFAULT_JUNK_DIRS: Set[str] = {
     '.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build',
@@ -110,8 +147,7 @@ This file contains a complete dump of the repository's source code for LLM analy
 
 Format:
 - The file starts with a directory tree structure (if enabled)
-- Each file is delimited with: ### File: <path>
-- Code blocks use markdown syntax with language hints (e.g., ```python)
+- Each file is delimited with XML tags: <file path="..."><![CDATA[...code...]]></file>
 - Files are processed in alphabetical order within each directory
 
 Usage tips:
@@ -322,8 +358,8 @@ class RepoProcessor:
         ignore_patterns: Optional[List[str]] = None,
         include_patterns: Optional[List[str]] = None,
         use_gitignore: bool = True,
-        start_delimiter: str = "### File: {path}\n```{lang}",
-        end_delimiter: str = "```",
+        start_delimiter: Optional[str] = None,  # None = use XML format by default
+        end_delimiter: Optional[str] = None,
         verbose: bool = True,
         dry_run: bool = False,
         max_file_size: int = 512000,  # 500KB default
@@ -335,14 +371,17 @@ class RepoProcessor:
         sort_priority: bool = True,
         git_branch: Optional[str] = None,
         git_commit: Optional[str] = None,
+        use_xml_format: bool = True,  # New: Use XML-style delimiters
+        use_git_ls_files: bool = False,  # New: Use git ls-files for faster traversal
+        skeleton_mode: bool = False,  # New: Use tree-sitter for skeleton extraction
+        skeleton_threshold: int = 1000,  # Token threshold for skeleton mode
+        config_file: Optional[str] = None,  # New: Path to config file
     ):
         self.repo_path = Path(repo_path).resolve()
         self.output_file = Path(output_file).resolve()
         self.ignore_patterns = ignore_patterns or []
         self.include_patterns = include_patterns or []
         self.use_gitignore = use_gitignore
-        self.start_delimiter = start_delimiter
-        self.end_delimiter = end_delimiter
         self.verbose = verbose
         self.dry_run = dry_run
         self.max_file_size = max_file_size
@@ -354,7 +393,20 @@ class RepoProcessor:
         self.sort_priority = sort_priority
         self.git_branch = git_branch
         self.git_commit = git_commit
+        self.use_xml_format = use_xml_format
+        self.use_git_ls_files = use_git_ls_files
+        self.skeleton_mode = skeleton_mode
+        self.skeleton_threshold = skeleton_threshold
+        self.config_file = config_file
         self.total_tokens = 0
+
+        # Set delimiters based on format choice
+        if use_xml_format:
+            self.start_delimiter = "<file path=\"{path}\"><![CDATA["
+            self.end_delimiter = "]]></file>"
+        else:
+            self.start_delimiter = start_delimiter or "### File: {path}\n```{lang}"
+            self.end_delimiter = end_delimiter or "```"
 
         # Cache for nested .gitignore specs: maps directory path -> PathSpec
         self.gitignore_cache: Dict[str, Optional[pathspec.PathSpec]] = {}
@@ -362,12 +414,43 @@ class RepoProcessor:
         # Temporary directory for git worktree (if using git branch/commit)
         self._temp_worktree: Optional[Path] = None
 
+        # Cache for git ls-files results
+        self._git_files_cache: Optional[List[str]] = None
+
         # Load all specs upfront
         self.spec = self._load_spec()
 
     def _load_spec(self):
         """Load pathspec with support for nested .gitignore files."""
         patterns = []
+
+        # Load config file if specified
+        if self.config_file:
+            config_path = Path(self.config_file)
+            if config_path.exists():
+                try:
+                    import tomllib
+                except ImportError:
+                    import tomli as tomllib
+
+                with open(config_path, "rb") as f:
+                    config = tomllib.load(f)
+
+                # Load ignore patterns from config
+                if 'ignore' in config:
+                    patterns.extend(config['ignore'])
+                    # Also add to self.ignore_patterns for visibility
+                    self.ignore_patterns.extend(config['ignore'])
+
+                # Load other config options if not already set
+                if self.include_patterns is None and 'include' in config:
+                    self.include_patterns = config['include']
+
+                if self.max_tokens is None and 'max_tokens' in config:
+                    self.max_tokens = config['max_tokens']
+
+                if self.max_file_size == 512000 and 'max_file_size' in config:
+                    self.max_file_size = config['max_file_size']
 
         # Load root .gitignore if it exists and gitignore is enabled
         if self.use_gitignore:
@@ -386,6 +469,54 @@ class RepoProcessor:
         if pathspec and patterns:
             return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
         return None
+
+    def _get_git_files(self) -> List[str]:
+        """
+        Get list of tracked files using git ls-files (faster than os.walk).
+        
+        Returns:
+            List of relative file paths tracked by git
+        """
+        if self._git_files_cache is not None:
+            return self._git_files_cache
+        
+        # Check if this is a git repository
+        git_dir = self.repo_path / '.git'
+        if not git_dir.exists():
+            return []
+        
+        try:
+            # Verify git is available
+            result = subprocess.run(
+                ['git', '--version'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=str(self.repo_path)
+            )
+            if result.returncode != 0:
+                return []
+            
+            # Get all tracked files
+            result = subprocess.run(
+                ['git', 'ls-files'],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=str(self.repo_path)
+            )
+            
+            if result.returncode != 0:
+                return []
+            
+            # Cache and return
+            self._git_files_cache = result.stdout.strip().split('\n') if result.stdout.strip() else []
+            return self._git_files_cache
+            
+        except (subprocess.TimeoutExpired, Exception) as e:
+            if self.verbose:
+                logger.warning(f"git ls-files failed: {e}, falling back to os.walk")
+            return []
 
     def _load_nested_gitignore(self, directory: Path) -> Optional[pathspec.PathSpec]:
         """
@@ -492,18 +623,34 @@ class RepoProcessor:
         return False
 
     def _is_binary(self, file_path: Path) -> bool:
-        """Check if a file is binary by extension first, then by content."""
+        """Check if a file is binary by extension first, then by magic numbers, then by content."""
         # First check extension - fast path for obvious binary files
         if file_path.suffix.lower() in BINARY_EXTENSIONS:
             return True
 
         try:
             with open(file_path, "rb") as f:
-                # Read first 8KB to check for binary content
-                chunk = f.read(8192)
-                # Check for null bytes (common in binary files)
-                if b"\0" in chunk:
+                # Read first 16 bytes for magic number check
+                header = f.read(16)
+                
+                if not header:  # Empty file
+                    return False
+                
+                # Check magic numbers
+                for magic in MAGIC_PREFIXES:
+                    if header.startswith(magic):
+                        if self.verbose:
+                            logger.debug(f"Binary detected by magic number: {MAGIC_NUMBERS[magic]}")
+                        return True
+                
+                # Check for null bytes in header
+                if b"\0" in header:
                     return True
+                
+                # Read more content for encoding check
+                f.seek(0)
+                chunk = f.read(8192)
+                
                 # Try to decode as text with multiple encodings
                 # If any succeed, it's likely a text file
                 for enc in ['utf-8', 'utf-8-sig', 'latin-1']:
@@ -512,6 +659,7 @@ class RepoProcessor:
                         return False  # Successfully decoded, it's text
                     except UnicodeDecodeError:
                         continue
+                
                 # All encodings failed, likely binary
                 return True
         except Exception:
@@ -561,6 +709,11 @@ class RepoProcessor:
             Cleaned content with reduced token count
         """
         if not self.clean_mode:
+            # But still apply skeleton mode if enabled and content is large
+            if self.skeleton_mode:
+                content_tokens = estimate_tokens(content)
+                if content_tokens > self.skeleton_threshold:
+                    return self._extract_skeleton(content, lang)
             return content
 
         lines = content.splitlines()
@@ -626,7 +779,15 @@ class RepoProcessor:
                 prev_blank_count = 0
                 cleaned_lines.append(line)
 
-        return '\n'.join(cleaned_lines)
+        result = '\n'.join(cleaned_lines)
+        
+        # Apply skeleton mode if enabled and content is still large
+        if self.skeleton_mode:
+            result_tokens = estimate_tokens(result)
+            if result_tokens > self.skeleton_threshold:
+                result = self._extract_skeleton(result, lang)
+        
+        return result
 
     def _remove_python_comment(self, line: str) -> str:
         """
@@ -707,6 +868,203 @@ class RepoProcessor:
             i += 1
 
         return line
+
+    def _extract_skeleton(self, content: str, lang: str) -> str:
+        """
+        Extract skeleton (function/class signatures) from code using tree-sitter.
+        
+        Falls back to regex-based extraction if tree-sitter is not available.
+        
+        Args:
+            content: Original source code
+            lang: Language identifier
+            
+        Returns:
+            Skeletonized version with function bodies removed
+        """
+        if not self.skeleton_mode:
+            return content
+        
+        # Try tree-sitter first
+        try:
+            import tree_sitter
+            from tree_sitter import Language
+            
+            # Map language to tree-sitter grammar
+            lang_map = {
+                'python': ('tree-sitter-python', 'python.so'),
+                'javascript': ('tree-sitter-javascript', 'javascript.so'),
+                'typescript': ('tree-sitter-typescript', 'typescript.so'),
+            }
+            
+            if lang not in lang_map:
+                return self._extract_skeleton_regex(content, lang)
+            
+            # Try to load the language grammar
+            try:
+                ts_lang = Language(lang_map[lang][1], lang_map[lang][0].replace('tree-sitter-', ''))
+                parser = tree_sitter.Parser()
+                parser.set_language(ts_lang)
+                
+                # Parse the code
+                tree = parser.parse(content.encode())
+                
+                # Extract skeleton based on language
+                if lang == 'python':
+                    return self._extract_python_skeleton(tree, content)
+                elif lang in ('javascript', 'typescript'):
+                    return self._extract_js_skeleton(tree, content)
+                    
+            except Exception:
+                # Fall back to regex if tree-sitter fails
+                pass
+                
+        except ImportError:
+            pass
+        
+        # Fallback to regex-based extraction
+        return self._extract_skeleton_regex(content, lang)
+
+    def _extract_python_skeleton(self, tree, content: str) -> str:
+        """Extract Python skeleton using tree-sitter AST."""
+        lines = content.splitlines(keepends=True)
+        result_lines = []
+        
+        def walk(node):
+            # Keep class and function definitions, but strip bodies
+            if node.type in ('function_definition', 'class_definition'):
+                # Get the header line (def/class line)
+                start_point = node.start_point
+                end_point = node.end_point
+                
+                # Find the colon and keep just the signature
+                for line_num in range(start_point[0], min(end_point[0] + 1, len(lines))):
+                    line = lines[line_num]
+                    result_lines.append(line.rstrip())
+                    
+                    # If this is the first line and contains the signature, add pass statement
+                    if line_num == start_point[0]:
+                        if ':' in line:
+                            result_lines.append('    pass\n')
+                        return
+                    
+            elif node.type == 'module':
+                # Process children
+                for child in node.children:
+                    walk(child)
+            else:
+                # Keep other top-level statements (imports, constants, etc.)
+                if node.start_point[0] == node.end_point[0]:  # Single line
+                    line = lines[node.start_point[0]]
+                    if line.strip() and not line.strip().startswith('#'):
+                        result_lines.append(line)
+        
+        walk(tree.root_node)
+        return ''.join(result_lines) if result_lines else content
+
+    def _extract_js_skeleton(self, tree, content: str) -> str:
+        """Extract JavaScript/TypeScript skeleton using tree-sitter AST."""
+        lines = content.splitlines(keepends=True)
+        result_lines = []
+        
+        def walk(node):
+            # Keep class and function declarations
+            if node.type in ('function_declaration', 'class_declaration', 
+                            'method_definition', 'arrow_function'):
+                # Get just the signature
+                start_point = node.start_point
+                line = lines[start_point[0]]
+                result_lines.append(line.rstrip())
+                
+                # Add stub body
+                if '{' in line:
+                    result_lines.append('    {}\n')
+                return
+                    
+            elif node.type in ('program', 'lexical_declaration', 'variable_declaration'):
+                # Process children or keep declarations
+                has_children = False
+                for child in node.children:
+                    if child.type not in (';', '{', '}', '='):
+                        walk(child)
+                        has_children = True
+                
+                if not has_children and node.start_point[0] == node.end_point[0]:
+                    line = lines[node.start_point[0]]
+                    if line.strip() and not line.strip().startswith('//'):
+                        result_lines.append(line)
+            else:
+                # Keep other top-level statements
+                if node.start_point[0] == node.end_point[0]:
+                    line = lines[node.start_point[0]]
+                    if line.strip() and not line.strip().startswith('//'):
+                        result_lines.append(line)
+        
+        walk(tree.root_node)
+        return ''.join(result_lines) if result_lines else content
+
+    def _extract_skeleton_regex(self, content: str, lang: str) -> str:
+        """
+        Extract skeleton using regex patterns (fallback when tree-sitter unavailable).
+        
+        Args:
+            content: Original source code
+            lang: Language identifier
+            
+        Returns:
+            Skeletonized version with function bodies replaced by pass/{}
+        """
+        lines = content.splitlines()
+        result_lines = []
+        skip_until_dedent = False
+        brace_depth = 0
+        
+        if lang == 'python':
+            for i, line in enumerate(lines):
+                stripped = line.lstrip()
+                
+                # Keep function/class definitions
+                if stripped.startswith(('def ', 'class ', 'async def ')):
+                    result_lines.append(line.rstrip())
+                    result_lines.append('    pass')
+                    skip_until_dedent = True
+                    continue
+                
+                # Keep imports and module-level statements
+                if stripped.startswith(('import ', 'from ')) or (not stripped and result_lines):
+                    result_lines.append(line.rstrip())
+                    continue
+                
+                # Skip indented lines (function bodies)
+                if skip_until_dedent:
+                    if stripped and not line[0].isspace():
+                        skip_until_dedent = False
+                        result_lines.append(line.rstrip())
+                elif not line[0].isspace() if line else True:
+                    result_lines.append(line.rstrip())
+                    
+        elif lang in ('javascript', 'typescript', 'java', 'cpp', 'c', 'go', 'rust'):
+            for line in lines:
+                stripped = line.strip()
+                
+                # Keep function/class declarations
+                if any(kw in stripped for kw in ['function ', 'class ', 'interface ', 'struct ', 'impl ']):
+                    result_lines.append(line.rstrip())
+                    if '{' not in line:
+                        result_lines.append('{}')
+                    continue
+                
+                # Track brace depth for C-style languages
+                brace_depth += line.count('{') - line.count('}')
+                
+                # Keep lines at top level (brace_depth == 0) or declarations
+                if brace_depth <= 1:
+                    result_lines.append(line.rstrip())
+        else:
+            # Unknown language - return original
+            return content
+        
+        return '\n'.join(result_lines)
 
     def _clean_content_chunk(self, chunk: str) -> str:
         """
@@ -927,6 +1285,19 @@ class RepoProcessor:
         Yields:
             Tuples of (absolute_path, relative_path_str)
         """
+        # Use git ls-files if enabled and available
+        if self.use_git_ls_files:
+            git_files = self._get_git_files()
+            if git_files:
+                for rel_file in git_files:
+                    if not rel_file:  # Skip empty strings
+                        continue
+                    file_path = self.repo_path / rel_file
+                    if file_path.exists() and self._is_valid_file(file_path):
+                        yield (file_path, rel_file)
+                return
+        
+        # Fallback to os.walk
         for root, dirs, files in os.walk(self.repo_path):
             rel_dir = os.path.relpath(root, self.repo_path)
             if rel_dir == ".":
@@ -984,6 +1355,86 @@ class RepoProcessor:
             return False
 
         return False
+
+    def _calculate_token_budget(self, files: List[Tuple[Path, str]]) -> Dict[str, any]:
+        """
+        Calculate token budget and determine processing strategy for each file.
+        
+        Implements multi-pass approach:
+        1. Calculate tokens for all files
+        2. If total > max_tokens, mark non-priority files for cleaning
+        3. If still > max_tokens, mark non-priority files for skeleton mode
+        4. Only as last resort, exclude files based on depth
+        
+        Args:
+            files: List of (path, rel_path) tuples
+            
+        Returns:
+            Dict with processing instructions for each file
+        """
+        if not self.max_tokens:
+            # No budget constraint - process all files normally
+            return {rel_path: {'action': 'full', 'path': path} for path, rel_path in files}
+        
+        # First pass: estimate tokens for all files (without reading content)
+        file_estimates = []
+        for path, rel_path in files:
+            try:
+                size = path.stat().st_size
+                est_tokens = estimate_tokens(str(size))  # Rough estimate based on size
+            except (OSError, PermissionError):
+                est_tokens = 0
+            
+            # Check if priority file
+            is_priority = (rel_path in PRIORITY_FILES or 
+                          Path(rel_path).name in PRIORITY_FILES)
+            
+            # Calculate depth (deeper files are less important)
+            depth = len(Path(rel_path).parts)
+            
+            file_estimates.append({
+                'path': path,
+                'rel_path': rel_path,
+                'est_tokens': est_tokens,
+                'is_priority': is_priority,
+                'depth': depth,
+            })
+        
+        # Sort by priority (priority files first, then by depth)
+        file_estimates.sort(key=lambda x: (not x['is_priority'], x['depth']))
+        
+        # Second pass: determine action for each file
+        result = {}
+        running_total = 0
+        budget_remaining = self.max_tokens
+        
+        # Reserve 10% of budget for delimiters and tree
+        budget_remaining = int(budget_remaining * 0.9)
+        
+        for file_info in file_estimates:
+            rel_path = file_info['rel_path']
+            est_tokens = file_info['est_tokens']
+            is_priority = file_info['is_priority']
+            
+            if running_total + est_tokens <= budget_remaining:
+                # Can include full file
+                result[rel_path] = {'action': 'full', 'path': file_info['path']}
+                running_total += est_tokens
+            elif self.clean_mode and running_total + (est_tokens // 2) <= budget_remaining:
+                # Try cleaned version (estimated 50% reduction)
+                result[rel_path] = {'action': 'clean', 'path': file_info['path']}
+                running_total += est_tokens // 2
+            elif self.skeleton_mode and running_total + (est_tokens // 5) <= budget_remaining:
+                # Try skeleton version (estimated 80% reduction)
+                result[rel_path] = {'action': 'skeleton', 'path': file_info['path']}
+                running_total += est_tokens // 5
+            elif is_priority:
+                # Priority file - include anyway, even if over budget
+                result[rel_path] = {'action': 'full', 'path': file_info['path']}
+                running_total += est_tokens
+            # else: exclude file (don't add to result)
+        
+        return result
 
     def generate_tree_structure(self) -> str:
         """
@@ -1072,15 +1523,34 @@ class RepoProcessor:
                     if self.count_tokens:
                         self.total_tokens += get_tiktoken_token_count(tree_structure)
 
-                # Use unified generator for perfect tree-dump parity
-                for file_path, rel_file in self.get_valid_files():
+                # Collect all files first for token budgeting
+                all_files = list(self.get_valid_files())
+                
+                # Calculate token budget strategy if max_tokens is set
+                if self.max_tokens and not self.dry_run:
+                    file_strategy = self._calculate_token_budget(all_files)
+                else:
+                    file_strategy = {rel_path: {'action': 'full', 'path': path} 
+                                    for path, rel_path in all_files}
+
+                # Process files according to strategy
+                for file_path, rel_file in all_files:
+                    if rel_file not in file_strategy:
+                        # File was excluded by token budget
+                        if self.verbose:
+                            logger.info(f"Excluded '{rel_file}' due to token budget")
+                        continue
+                    
+                    strategy = file_strategy[rel_file]
+                    action = strategy['action']
+                    
                     if self.dry_run:
                         if self.verbose:
-                            logger.info(f"Would process: {rel_file}")
+                            logger.info(f"Would process: {rel_file} ({action})")
                         processed_count += 1
                         continue
 
-                    # Build delimiter with language hint for markdown
+                    # Build delimiter (XML format doesn't use language hints)
                     lang = get_language_from_path(rel_file)
                     start_header = self.start_delimiter.format(path=rel_file, lang=lang)
                     end_footer = self.end_delimiter.format(path=rel_file, lang=lang)
@@ -1090,85 +1560,46 @@ class RepoProcessor:
                     if self.count_tokens:
                         self.total_tokens += get_tiktoken_token_count(start_header + "\n")
 
-                    # For clean_mode, we need to read the whole file to properly handle comments
-                    # For non-clean mode, we can truly stream in chunks
-                    if self.clean_mode:
-                        # Read entire file for language-aware cleaning
-                        content = self._read_file_safely(file_path)
-                        if content.startswith("[Error:"):
-                            if self.verbose:
-                                logger.warning(f"Skipping '{rel_file}' - {content}")
-                            # Undo the start delimiter tokens
-                            if self.count_tokens:
-                                self.total_tokens -= get_tiktoken_token_count(start_header + "\n")
-                            continue
-
-                        # Clean with language awareness
-                        content = self._clean_content(content, lang)
-
-                        # Check max_tokens before writing
-                        if self.max_tokens:
-                            content_tokens = get_tiktoken_token_count(content)
-                            if self.total_tokens + content_tokens > self.max_tokens:
-                                logger.warning(f"Token limit reached. Stopping dump at '{rel_file}'.")
-                                outfile.write("\n")
-                                outfile.write(end_footer + "\n")
-                                if self.count_tokens:
-                                    self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
-                                processed_count += 1
-                                break
-
-                        # Write cleaned content
-                        outfile.write(content)
+                    # Read and process file based on strategy
+                    content = self._read_file_safely(file_path)
+                    if content.startswith("[Error:"):
+                        if self.verbose:
+                            logger.warning(f"Skipping '{rel_file}' - {content}")
                         if self.count_tokens:
-                            self.total_tokens += get_tiktoken_token_count(content)
-                    else:
-                        # True streaming mode - read and write in chunks
-                        chunk_size = 16384  # 16KB chunks
-                        encoding_errors_handled = False
-                        file_stopped_early = False
+                            self.total_tokens -= get_tiktoken_token_count(start_header + "\n")
+                        continue
 
-                        for enc in ['utf-8-sig', 'utf-8', 'latin-1']:
-                            try:
-                                with open(file_path, "r", encoding=enc, errors='replace') as f_in:
-                                    while True:
-                                        chunk = f_in.read(chunk_size)
-                                        if not chunk:
-                                            break
+                    # Apply processing based on strategy
+                    if action == 'skeleton':
+                        content = self._extract_skeleton(content, lang)
+                    elif action == 'clean':
+                        # Temporarily enable clean_mode for this file
+                        original_clean = self.clean_mode
+                        self.clean_mode = True
+                        content = self._clean_content(content, lang)
+                        self.clean_mode = original_clean
+                    elif self.clean_mode:
+                        # Global clean_mode is enabled but strategy is 'full'
+                        # Still apply cleaning
+                        content = self._clean_content(content, lang)
+                    # else: action == 'full' and clean_mode off, use content as-is
 
-                                        outfile.write(chunk)
-
-                                        # Count tokens incrementally
-                                        if self.count_tokens:
-                                            self.total_tokens += get_tiktoken_token_count(chunk)
-
-                                        # Check token limit during streaming
-                                        if self.max_tokens and self.total_tokens >= self.max_tokens:
-                                            logger.warning(f"Token limit reached mid-file at '{rel_file}'.")
-                                            file_stopped_early = True
-                                            break
-
-                                    if file_stopped_early:
-                                        break
-
-                                if not file_stopped_early:
-                                    break  # Successfully read file
-
-                            except (OSError, PermissionError) as e:
-                                if self.verbose:
-                                    logger.warning(f"Skipping '{rel_file}' - {e}")
-                                # Undo the start delimiter tokens
-                                if self.count_tokens:
-                                    self.total_tokens -= get_tiktoken_token_count(start_header + "\n")
-                                break
-
-                        if file_stopped_early:
+                    # Check max_tokens before writing
+                    if self.max_tokens:
+                        content_tokens = get_tiktoken_token_count(content)
+                        if self.total_tokens + content_tokens > self.max_tokens:
+                            logger.warning(f"Token limit reached. Stopping dump at '{rel_file}'.")
                             outfile.write("\n")
                             outfile.write(end_footer + "\n")
                             if self.count_tokens:
                                 self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
                             processed_count += 1
                             break
+
+                    # Write content
+                    outfile.write(content)
+                    if self.count_tokens:
+                        self.total_tokens += get_tiktoken_token_count(content)
 
                     # Ensure file ends with newline before end delimiter
                     outfile.write("\n")

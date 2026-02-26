@@ -1,0 +1,20 @@
+# Git Dump configuration file
+# Place this file as .gitdumprc.toml or .gitdump.toml in your repository root
+
+# Patterns to ignore (in addition to .gitignore)
+ignore = [
+    "*.log",
+    "*.pid",
+    "*.lock",
+    "temp/",
+    ".pytest_cache/",
+]
+
+# Patterns to include (optional - if not set, includes all non-ignored files)
+# include = ["*.py", "*.md", "*.toml"]
+
+# Maximum token count (for smart budgeting)
+# max_tokens = 50000
+
+# Maximum file size in bytes (default: 512000 = 500KB)
+# max_file_size = 512000
