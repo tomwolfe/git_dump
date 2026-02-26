@@ -3,6 +3,10 @@
 import os
 import sys
 import logging
+import subprocess
+import tempfile
+import shutil
+import re
 from pathlib import Path
 from typing import List, Optional, Generator, Tuple, Dict, Set
 import fnmatch
@@ -49,6 +53,55 @@ DEFAULT_IGNORE_PATTERNS: List[str] = [
     '.env', '.env.local', '.env.*.local',
     '*.min.js', '*.min.css',
     'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+]
+
+# Priority files to sort first (for better LLM context)
+PRIORITY_FILES: List[str] = [
+    'README.md',
+    'README.rst',
+    'README.txt',
+    'CHANGELOG.md',
+    'LICENSE',
+    'LICENSE.md',
+    'LICENSE.txt',
+    'CONTRIBUTING.md',
+    'pyproject.toml',
+    'setup.py',
+    'setup.cfg',
+    'requirements.txt',
+    'requirements-dev.txt',
+    'package.json',
+    'package-lock.json',
+    'yarn.lock',
+    'tsconfig.json',
+    'jsconfig.json',
+    'Cargo.toml',
+    'go.mod',
+    'go.sum',
+    'Gemfile',
+    'Gemfile.lock',
+    'pom.xml',
+    'build.gradle',
+    'settings.gradle',
+    'CMakeLists.txt',
+    'Makefile',
+    'Dockerfile',
+    'docker-compose.yml',
+    'docker-compose.yaml',
+    '.gitignore',
+    '.editorconfig',
+    'main.py',
+    'app.py',
+    'index.py',
+    'index.js',
+    'index.ts',
+    'main.js',
+    'main.ts',
+    'app.js',
+    'app.ts',
+    'src/main.py',
+    'src/main.js',
+    'src/main.ts',
 ]
 
 # LLM instructions header to prepend to output
@@ -277,6 +330,11 @@ class RepoProcessor:
         include_tree: bool = True,
         count_tokens: bool = False,
         use_clipboard: bool = False,
+        max_tokens: Optional[int] = None,
+        clean_mode: bool = False,
+        sort_priority: bool = True,
+        git_branch: Optional[str] = None,
+        git_commit: Optional[str] = None,
     ):
         self.repo_path = Path(repo_path).resolve()
         self.output_file = Path(output_file).resolve()
@@ -291,10 +349,18 @@ class RepoProcessor:
         self.include_tree = include_tree
         self.count_tokens = count_tokens
         self.use_clipboard = use_clipboard
+        self.max_tokens = max_tokens
+        self.clean_mode = clean_mode
+        self.sort_priority = sort_priority
+        self.git_branch = git_branch
+        self.git_commit = git_commit
         self.total_tokens = 0
 
         # Cache for nested .gitignore specs: maps directory path -> PathSpec
         self.gitignore_cache: Dict[str, Optional[pathspec.PathSpec]] = {}
+
+        # Temporary directory for git worktree (if using git branch/commit)
+        self._temp_worktree: Optional[Path] = None
 
         # Load all specs upfront
         self.spec = self._load_spec()
@@ -477,6 +543,221 @@ class RepoProcessor:
 
         return "[Error: Could not decode file with any supported encoding]"
 
+    def _clean_content(self, content: str) -> str:
+        """
+        Clean content to reduce token count.
+
+        Removes:
+        - Excessive blank lines (more than 2 consecutive)
+        - Leading/trailing whitespace on each line
+        - Single-line comments (for supported languages)
+        - Multi-line comments (for supported languages)
+
+        Args:
+            content: Original file content
+
+        Returns:
+            Cleaned content with reduced token count
+        """
+        if not self.clean_mode:
+            return content
+
+        lines = content.splitlines()
+        cleaned_lines = []
+        in_multiline_comment = False
+        prev_blank_count = 0
+
+        # Detect language from file extension patterns in content
+        # This is a simple heuristic - could be improved
+        is_python = any(line.strip().startswith('#') for line in lines[:10])
+        is_js_ts = any(
+            'function' in line or 'const ' in line or 'let ' in line or 'import ' in line
+            for line in lines[:10]
+        )
+        is_c_style = any(
+            'void ' in line or 'int ' in line or '#include' in line
+            for line in lines[:10]
+        )
+
+        for line in lines:
+            # Handle multi-line comments
+            if in_multiline_comment:
+                if '*/' in line:
+                    in_multiline_comment = False
+                    line = line[line.index('*/') + 2:]
+                else:
+                    continue
+
+            # Remove single-line comments based on language
+            if is_python:
+                # Python: remove # comments but keep shebangs and encoding declarations
+                if '#' in line and not line.strip().startswith('#!') and not 'coding:' in line:
+                    # Only remove if # is not in a string (simple heuristic)
+                    if "'" not in line and '"' not in line:
+                        line = line.split('#')[0]
+                # Python docstrings are harder to detect - skip for now
+            elif is_js_ts or is_c_style:
+                # Remove // comments
+                if '//' in line:
+                    # Check it's not in a string (simple heuristic)
+                    before_slash = line.split('//')[0]
+                    if before_slash.count('"') % 2 == 0 and before_slash.count("'") % 2 == 0:
+                        line = before_slash
+
+                # Check for /* start of multi-line comment
+                if '/*' in line:
+                    if '*/' in line:
+                        # Single-line block comment
+                        line = re.sub(r'/\*.*?\*/', '', line)
+                    else:
+                        # Start of multi-line comment
+                        line = line[:line.index('/*')]
+                        in_multiline_comment = True
+
+            # Strip leading/trailing whitespace
+            line = line.rstrip()
+
+            # Track consecutive blank lines
+            if not line.strip():
+                prev_blank_count += 1
+                if prev_blank_count <= 2:  # Allow up to 2 consecutive blank lines
+                    cleaned_lines.append(line)
+            else:
+                prev_blank_count = 0
+                cleaned_lines.append(line)
+
+        return '\n'.join(cleaned_lines)
+
+    def _setup_git_worktree(self) -> Optional[Path]:
+        """
+        Set up a git worktree for a specific branch or commit.
+
+        Returns:
+            Path to the worktree directory, or None if not using git
+        """
+        if not self.git_branch and not self.git_commit:
+            return None
+
+        # Check if repo_path is a git repository
+        git_dir = self.repo_path / '.git'
+        if not git_dir.exists():
+            logger.warning("Not a git repository. Ignoring --branch/--commit options.")
+            return None
+
+        try:
+            # Verify git is available
+            result = subprocess.run(
+                ['git', '--version'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                logger.warning("Git not available. Ignoring --branch/--commit options.")
+                return None
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            logger.warning("Git not available. Ignoring --branch/--commit options.")
+            return None
+
+        # Create a temporary worktree
+        self._temp_worktree = Path(tempfile.mkdtemp(prefix='git_dump_worktree_'))
+
+        try:
+            if self.git_branch:
+                # Create worktree for branch
+                cmd = [
+                    'git', '-C', str(self.repo_path),
+                    'worktree', 'add', '-f', str(self._temp_worktree),
+                    self.git_branch
+                ]
+            else:
+                # Create detached worktree for commit
+                cmd = [
+                    'git', '-C', str(self.repo_path),
+                    'worktree', 'add', '-f', '--detach', str(self._temp_worktree),
+                    self.git_commit
+                ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                logger.error(f"Failed to create git worktree: {result.stderr}")
+                shutil.rmtree(self._temp_worktree, ignore_errors=True)
+                self._temp_worktree = None
+                return None
+
+            # Update repo_path to point to worktree
+            original_repo_path = self.repo_path
+            self.repo_path = self._temp_worktree
+
+            if self.verbose:
+                ref = self.git_branch or self.git_commit
+                logger.info(f"Created git worktree at {self._temp_worktree} for {ref}")
+
+            # Reload specs for the new repo_path
+            self.spec = self._load_spec()
+            self.gitignore_cache.clear()
+
+            return self._temp_worktree
+
+        except Exception as e:
+            logger.error(f"Error setting up git worktree: {e}")
+            if self._temp_worktree and self._temp_worktree.exists():
+                shutil.rmtree(self._temp_worktree, ignore_errors=True)
+            self._temp_worktree = None
+            return None
+
+    def _cleanup_git_worktree(self):
+        """Clean up the temporary git worktree."""
+        if self._temp_worktree and self._temp_worktree.exists():
+            try:
+                # Remove the worktree
+                subprocess.run(
+                    ['git', '-C', str(self.repo_path.parent), 'worktree', 'remove',
+                     '-f', str(self._temp_worktree)],
+                    capture_output=True,
+                    timeout=30
+                )
+            except Exception:
+                # Fallback to shutil if git remove fails
+                pass
+
+            shutil.rmtree(self._temp_worktree, ignore_errors=True)
+            self._temp_worktree = None
+
+            if self.verbose:
+                logger.info("Cleaned up git worktree")
+
+    def _sort_files(self, files: List[str], rel_dir: str) -> List[str]:
+        """
+        Sort files with priority files first.
+
+        Args:
+            files: List of filenames in the current directory
+            rel_dir: Relative directory path (for constructing full relative paths)
+
+        Returns:
+            Sorted list of files
+        """
+        if not self.sort_priority:
+            return sorted(files, key=str.lower)
+
+        def get_priority(file: str) -> Tuple[int, str]:
+            # Construct the relative path for priority checking
+            rel_path = os.path.join(rel_dir, file) if rel_dir else file
+            # Normalize to forward slashes
+            rel_path_normalized = rel_path.replace('\\', '/')
+
+            # Check if file or path is in priority list
+            if rel_path_normalized in PRIORITY_FILES:
+                return (0, PRIORITY_FILES.index(rel_path_normalized))
+            if file in PRIORITY_FILES:
+                return (0, PRIORITY_FILES.index(file))
+
+            # Non-priority files come after, sorted alphabetically
+            return (1, file.lower())
+
+        return sorted(files, key=get_priority)
+
     def _should_include_in_tree(self, item_path: Path) -> bool:
         """
         Check if a file or directory should appear in the tree.
@@ -556,7 +837,10 @@ class RepoProcessor:
     def process(self) -> int:
         processed_count = 0
         output_content = []
-        
+
+        # Set up git worktree if branch/commit specified
+        self._setup_git_worktree()
+
         if self.dry_run:
             if self.verbose:
                 logger.info("Dry run mode: No files will be written.")
@@ -596,7 +880,10 @@ class RepoProcessor:
                     for d in dirs_to_remove:
                         dirs.remove(d)
 
-                    for filename in sorted(files):
+                    # Sort files with priority files first
+                    files = self._sort_files(files, rel_dir)
+
+                    for filename in files:
                         rel_file = os.path.join(rel_dir, filename) if rel_dir else filename
 
                         if self.is_ignored(rel_file, Path(root)):
@@ -646,6 +933,23 @@ class RepoProcessor:
                                     logger.warning(f"Skipping '{rel_file}' - {content}")
                                 continue
 
+                            # Clean content if requested
+                            if self.clean_mode:
+                                content = self._clean_content(content)
+
+                            # Check max_tokens before writing content
+                            if self.max_tokens:
+                                content_tokens = get_tiktoken_token_count(content)
+                                if self.total_tokens + content_tokens > self.max_tokens:
+                                    logger.warning(f"Token limit reached. Stopping dump at '{rel_file}'.")
+                                    # Write end delimiter for incomplete file
+                                    outfile.write("\n")
+                                    outfile.write(end_footer + "\n")
+                                    if self.count_tokens:
+                                        self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
+                                    processed_count += 1
+                                    break
+
                             # STREAM file content to output (memory efficient for large files)
                             # Write in chunks to avoid loading entire file into memory for token counting
                             chunk_size = 8192
@@ -655,6 +959,11 @@ class RepoProcessor:
                                 if self.count_tokens:
                                     self.total_tokens += get_tiktoken_token_count(chunk)
 
+                                # Check token limit during streaming
+                                if self.max_tokens and self.total_tokens >= self.max_tokens:
+                                    logger.warning(f"Token limit reached mid-file at '{rel_file}'.")
+                                    break
+
                             # Ensure file ends with newline before end delimiter
                             outfile.write("\n")
                             outfile.write(end_footer + "\n")
@@ -662,12 +971,22 @@ class RepoProcessor:
                                 self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
 
                             processed_count += 1
+
+                            # Final check after file
+                            if self.max_tokens and self.total_tokens >= self.max_tokens:
+                                break
+
                         except PermissionError as e:
                             if self.verbose:
                                 logger.warning(f"Skipping '{rel_file}' - Permission denied: {e}")
                         except Exception as e:
                             if self.verbose:
                                 logger.error(f"Error processing '{rel_file}': {e}")
+
+                    # Check if we hit token limit and need to stop processing directories
+                    if self.max_tokens and self.total_tokens >= self.max_tokens:
+                        break
+
             finally:
                 if outfile:
                     outfile.close()
@@ -687,8 +1006,14 @@ class RepoProcessor:
                     except Exception as e:
                         if self.verbose:
                             logger.warning(f"Could not copy to clipboard: {e}")
+
+                # Clean up git worktree if created
+                self._cleanup_git_worktree()
+
         except Exception as e:
             logger.error(f"Fatal error: {e}")
+            # Clean up git worktree on fatal error
+            self._cleanup_git_worktree()
             sys.exit(1)
 
         return processed_count

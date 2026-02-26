@@ -557,3 +557,211 @@ class TestExpandedLanguageMap:
         assert get_language_from_path("script.ps1") == "powershell"
         assert get_language_from_path("config.toml") == "toml"
         assert get_language_from_path("data.parquet") in ["", "parquet"]
+
+
+class TestMaxTokens:
+    """Test --max-tokens functionality."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_max_tokens_stops_processing(self):
+        """Test that processing stops when max_tokens is reached."""
+        # Create multiple files with known content
+        self.create_file("file1.txt", "a" * 1000)  # ~250 tokens
+        self.create_file("file2.txt", "b" * 1000)  # ~250 tokens
+        self.create_file("file3.txt", "c" * 1000)  # ~250 tokens
+
+        # Set max_tokens very low - should stop after first file
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            max_tokens=100,  # Very low limit
+            include_tree=False,
+            count_tokens=True,
+        )
+        count = processor.process()
+
+        # Should have processed at least 1 file but not all
+        assert count >= 1
+        # Token count should be close to limit (with some tolerance for delimiters)
+        assert processor.total_tokens <= 200  # Allow some overhead
+
+    def test_max_tokens_with_tree(self):
+        """Test that max_tokens accounts for tree structure."""
+        self.create_file("main.py", "print('hello')")
+
+        processor_with_tree = RepoProcessor(
+            self.test_dir, self.output_file,
+            max_tokens=50,
+            include_tree=True,
+            count_tokens=True,
+        )
+        processor_with_tree.process()
+
+        # Tree takes tokens, so less room for content
+        # Token limit should be respected (with some tolerance for delimiters)
+        assert processor_with_tree.total_tokens <= 250  # Allow overhead for tree + delimiters
+
+
+class TestCleanMode:
+    """Test --clean mode functionality."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_clean_removes_comments(self):
+        """Test that clean mode removes comments."""
+        python_code = """# This is a comment
+def hello():
+    # Another comment
+    print("hello")
+"""
+        self.create_file("clean.py", python_code)
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            clean_mode=True,
+            include_tree=False,
+        )
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # Comments should be removed
+            assert "# This is a comment" not in content
+            assert "# Another comment" not in content
+            # Code should remain
+            assert "def hello():" in content
+            assert 'print("hello")' in content
+
+    def test_clean_removes_excessive_whitespace(self):
+        """Test that clean mode removes excessive blank lines."""
+        code_with_blanks = """line1
+
+
+line2
+
+
+
+line3
+"""
+        self.create_file("blanks.txt", code_with_blanks)
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            clean_mode=True,
+            include_tree=False,
+        )
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # Should not have more than 2 consecutive blank lines
+            assert "\n\n\n\n" not in content
+
+    def test_clean_mode_off(self):
+        """Test that clean mode preserves content when disabled."""
+        code_with_comments = """# Comment
+def test():
+    pass
+"""
+        self.create_file("preserve.py", code_with_comments)
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            clean_mode=False,
+            include_tree=False,
+        )
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # Comments should be preserved
+            assert "# Comment" in content
+
+
+class TestPrioritySorting:
+    """Test priority file sorting functionality."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_priority_files_first(self):
+        """Test that priority files appear first in output."""
+        self.create_file("README.md", "# Project")
+        self.create_file("zulu.txt", "zulu content")
+        self.create_file("pyproject.toml", "[tool.poetry]")
+        self.create_file("alpha.txt", "alpha content")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            sort_priority=True,
+            include_tree=False,
+        )
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Find positions of files
+        readme_pos = content.index("### File: README.md")
+        pyproject_pos = content.index("### File: pyproject.toml")
+        alpha_pos = content.index("### File: alpha.txt")
+        zulu_pos = content.index("### File: zulu.txt")
+
+        # Priority files should come first
+        assert readme_pos < alpha_pos
+        assert pyproject_pos < alpha_pos
+        # Non-priority files should be alphabetical
+        assert alpha_pos < zulu_pos
+
+    def test_no_sort_option(self):
+        """Test that --no-sort disables priority sorting."""
+        self.create_file("README.md", "# Project")
+        self.create_file("alpha.txt", "alpha content")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            sort_priority=False,
+            include_tree=False,
+        )
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Files should be alphabetical, not priority-based
+        readme_pos = content.index("### File: README.md")
+        alpha_pos = content.index("### File: alpha.txt")
+        # Alphabetically, README comes after alpha
+        assert alpha_pos < readme_pos

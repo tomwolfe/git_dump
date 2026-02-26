@@ -36,13 +36,13 @@ def main():
         "--include", action="append", help="Patterns to include (e.g., '*.py')"
     )
     parser.add_argument(
-        "--start-delimiter", 
-        default="### File: {path}\n```{lang}", 
+        "--start-delimiter",
+        default="### File: {path}\n```{lang}",
         help="Custom start delimiter (use {path} and {lang} placeholders)"
     )
     parser.add_argument(
-        "--end-delimiter", 
-        default="```", 
+        "--end-delimiter",
+        default="```",
         help="Custom end delimiter"
     )
     parser.add_argument(
@@ -61,8 +61,28 @@ def main():
         "--count-tokens", action="store_true", help="Count total tokens in output (requires tiktoken if available)"
     )
     parser.add_argument(
-        "--clipboard", "--clip", action="store_true", dest="use_clipboard", 
+        "--clipboard", "--clip", action="store_true", dest="use_clipboard",
         help="Copy output to clipboard (requires pyperclip: pip install pyperclip)"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=None,
+        help="Maximum token count limit. Stops processing when reached (requires tiktoken for accurate counting)"
+    )
+    parser.add_argument(
+        "--clean", action="store_true", dest="clean_mode",
+        help="Clean files by removing comments and excessive whitespace to reduce token count"
+    )
+    parser.add_argument(
+        "--no-sort", action="store_false", dest="sort_priority",
+        help="Disable priority sorting (README, config files first)"
+    )
+    parser.add_argument(
+        "--branch", type=str, default=None,
+        help="Git branch to dump (uses git worktree temporarily)"
+    )
+    parser.add_argument(
+        "--commit", type=str, default=None,
+        help="Git commit hash to dump (uses git worktree temporarily)"
     )
 
     args = parser.parse_args()
@@ -87,6 +107,11 @@ def main():
         include_tree=args.include_tree,
         count_tokens=args.count_tokens,
         use_clipboard=args.use_clipboard,
+        max_tokens=args.max_tokens,
+        clean_mode=args.clean_mode,
+        sort_priority=args.sort_priority,
+        git_branch=args.branch,
+        git_commit=args.commit,
     )
 
     if args.verbose:
