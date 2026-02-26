@@ -2,7 +2,7 @@ import os
 import shutil
 import tempfile
 import pytest
-from src.git_dump.core import RepoProcessor, generate_tree_structure
+from src.git_dump.core import RepoProcessor
 
 
 class TestRepoProcessor:
@@ -170,23 +170,84 @@ class TestRepoProcessor:
             assert "main.py" in content
             assert "README.md" in content
 
+    def test_tree_matches_dump(self):
+        """Test that the tree structure matches what's actually dumped."""
+        self.create_file(".gitignore", "*.log")
+        self.create_file("main.py", "print('hello')")
+        self.create_file("app.log", "log content")
+        self.create_file("subdir/test.py", "pass")
+        self.create_file("subdir/debug.log", "debug")
 
-def test_generate_tree_structure():
-    # Create a temporary directory structure for testing
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=True)
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        # Tree section
+        tree_start = content.index("--- REPOSITORY STRUCTURE ---")
+        tree_end = content.index("--- END REPOSITORY STRUCTURE ---")
+        tree_section = content[tree_start:tree_end]
+        
+        # Tree should NOT mention .log files (they're ignored)
+        assert "app.log" not in tree_section
+        assert "debug.log" not in tree_section
+        
+        # Tree SHOULD mention .py files
+        assert "main.py" in tree_section
+        assert "test.py" in tree_section
+        
+        # Dump section should also NOT contain .log file contents
+        assert "--- FILE: app.log ---" not in content
+        assert "--- FILE: subdir/debug.log ---" not in content
+
+    def test_tree_structure_method(self):
+        """Test the generate_tree_structure method directly."""
+        self.create_file("main.py", "print('hello')")
+        self.create_file("README.md", "# project")
+        os.makedirs(os.path.join(self.test_dir, "subdir"))
+        self.create_file("subdir/test.py", "pass")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        tree = processor.generate_tree_structure()
+
+        assert "--- REPOSITORY STRUCTURE ---" in tree
+        assert "--- END REPOSITORY STRUCTURE ---" in tree
+        assert "main.py" in tree
+        assert "README.md" in tree
+        assert "subdir/" in tree
+        assert "test.py" in tree
+
+
+def test_gitignore_cache():
+    """Test that gitignore specs are cached properly."""
     test_dir = tempfile.mkdtemp()
     try:
-        os.makedirs(os.path.join(test_dir, "subdir"))
-        with open(os.path.join(test_dir, "file1.txt"), "w") as f:
-            f.write("content1")
-        with open(os.path.join(test_dir, "subdir", "file2.txt"), "w") as f:
-            f.write("content2")
+        # Create nested .gitignore files
+        os.makedirs(os.path.join(test_dir, "subdir1"))
+        os.makedirs(os.path.join(test_dir, "subdir2"))
         
-        tree_output = generate_tree_structure(test_dir)
+        with open(os.path.join(test_dir, ".gitignore"), "w") as f:
+            f.write("*.log\n")
+        with open(os.path.join(test_dir, "subdir1", ".gitignore"), "w") as f:
+            f.write("*.tmp\n")
         
-        assert "--- REPOSITORY STRUCTURE ---" in tree_output
-        assert "--- END REPOSITORY STRUCTURE ---" in tree_output
-        assert "file1.txt" in tree_output
-        assert "subdir/" in tree_output
-        assert "file2.txt" in tree_output
+        output_file = os.path.join(test_dir, "output.txt")
+        processor = RepoProcessor(test_dir, output_file)
+        
+        # First call should load and cache
+        spec1 = processor._load_nested_gitignore(os.path.join(test_dir, "subdir1"))
+        assert spec1 is not None
+        
+        # Second call should return cached version
+        spec2 = processor._load_nested_gitignore(os.path.join(test_dir, "subdir1"))
+        assert spec2 is spec1  # Same object (cached)
+        
+        # Non-existent gitignore should cache None
+        spec3 = processor._load_nested_gitignore(os.path.join(test_dir, "subdir2"))
+        assert spec3 is None
+        
+        # Should be cached
+        assert os.path.join(test_dir, "subdir2") in processor.gitignore_cache
     finally:
         shutil.rmtree(test_dir)

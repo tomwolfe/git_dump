@@ -4,7 +4,7 @@ import argparse
 import logging
 import os
 import sys
-from .core import RepoProcessor, get_tiktoken_token_count, generate_tree_structure
+from .core import RepoProcessor, get_tiktoken_token_count
 
 
 def setup_logging(verbose: bool):

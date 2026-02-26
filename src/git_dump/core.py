@@ -4,7 +4,7 @@ import os
 import sys
 import logging
 from pathlib import Path
-from typing import List, Optional, Generator, Tuple
+from typing import List, Optional, Generator, Tuple, Dict
 import fnmatch
 
 try:
@@ -18,10 +18,10 @@ logger = logging.getLogger(__name__)
 def estimate_tokens(text: str) -> int:
     """
     Estimate token count using a 1:4 character-to-token ratio.
-    
+
     Args:
         text: Input text to estimate tokens for
-        
+
     Returns:
         Estimated number of tokens
     """
@@ -31,11 +31,11 @@ def estimate_tokens(text: str) -> int:
 def get_tiktoken_token_count(text: str, encoding_name: str = "cl100k_base") -> int:
     """
     Get exact token count using tiktoken if available.
-    
+
     Args:
         text: Input text to count tokens for
         encoding_name: Name of the encoding to use
-        
+
     Returns:
         Exact number of tokens or estimated count if tiktoken unavailable
     """
@@ -46,68 +46,6 @@ def get_tiktoken_token_count(text: str, encoding_name: str = "cl100k_base") -> i
     except ImportError:
         # Fallback to character-based estimation
         return estimate_tokens(text)
-
-
-def generate_tree_structure(repo_path: str, max_depth: Optional[int] = None) -> str:
-    """
-    Generate a text-based directory tree structure.
-
-    Args:
-        repo_path: Path to the repository
-        max_depth: Maximum depth to traverse (None for unlimited)
-
-    Returns:
-        String representation of the directory tree
-    """
-    repo_path = Path(repo_path)
-    tree_lines = ["--- REPOSITORY STRUCTURE ---"]
-
-    def _should_ignore(path: Path) -> bool:
-        """Check if a path should be ignored based on common patterns."""
-        rel_path = path.relative_to(repo_path).as_posix()
-        # Common directories to skip for cleaner output
-        ignore_patterns = ['.git', '__pycache__', '.pytest_cache', '.ruff_cache', '.venv', 'venv', 'node_modules', '.DS_Store']
-        return any(ignore_part in rel_path.split('/') for ignore_part in ignore_patterns)
-
-    def _add_tree_item(item_path: Path, prefix: str = "", depth: int = 0):
-        if max_depth is not None and depth > max_depth:
-            return
-
-        if _should_ignore(item_path):
-            return
-
-        # Get relative path from repo root
-        rel_path = item_path.relative_to(repo_path)
-        if rel_path.name == "":
-            # This is the root
-            display_name = str(repo_path.name)
-        else:
-            display_name = rel_path.as_posix()
-
-        if item_path.is_dir():
-            # Add directory
-            tree_lines.append(f"{prefix}├── {display_name}/")
-            children = sorted([child for child in item_path.iterdir() if not _should_ignore(child)],
-                             key=lambda x: (x.is_file(), x.name.lower()))
-            for i, child in enumerate(children):
-                is_last = i == len(children) - 1
-                new_prefix = prefix + ("    " if is_last else "│   ")
-                _add_tree_item(child, new_prefix, depth + 1)
-        else:
-            # Add file
-            tree_lines.append(f"{prefix}├── {display_name}")
-
-    # Start with the root directory
-    tree_lines.append(f"{repo_path.name}/")
-    children = sorted([child for child in repo_path.iterdir() if not _should_ignore(child)],
-                     key=lambda x: (x.is_file(), x.name.lower()))
-    for i, child in enumerate(children):
-        is_last = i == len(children) - 1
-        prefix = "" if is_last else "│   "
-        _add_tree_item(child, prefix)
-
-    tree_lines.append("--- END REPOSITORY STRUCTURE ---\n")
-    return "\n".join(tree_lines)
 
 
 class RepoProcessor:
@@ -135,16 +73,21 @@ class RepoProcessor:
         self.end_delimiter = end_delimiter
         self.verbose = verbose
         self.dry_run = dry_run
-        self.max_file_size = max_file_size  # Max file size in bytes
+        self.max_file_size = max_file_size
         self.include_tree = include_tree
         self.count_tokens = count_tokens
         self.total_tokens = 0
+        
+        # Cache for nested .gitignore specs: maps directory path -> PathSpec
+        self.gitignore_cache: Dict[str, pathspec.PathSpec] = {}
+        
+        # Load all specs upfront
         self.spec = self._load_spec()
 
     def _load_spec(self):
         """Load pathspec with support for nested .gitignore files."""
         patterns = []
-        
+
         # Load root .gitignore if it exists and gitignore is enabled
         if self.use_gitignore:
             gitignore_path = os.path.join(self.repo_path, ".gitignore")
@@ -158,41 +101,44 @@ class RepoProcessor:
 
         # Add user-specified ignore patterns
         patterns.extend(self.ignore_patterns)
-        
+
         if pathspec and patterns:
             return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
         return None
 
-    def _get_nested_gitignore_specs(self, directory: str) -> List:
-        """Get all pathspecs from nested .gitignore files along the path."""
+    def _load_nested_gitignore(self, directory: str) -> Optional[pathspec.PathSpec]:
+        """
+        Load .gitignore spec for a specific directory (cached).
+        
+        Args:
+            directory: Absolute path to the directory
+            
+        Returns:
+            PathSpec for that directory's .gitignore, or None if not found/cached
+        """
         if not self.use_gitignore:
-            return []
-
-        specs = []
-        # Walk up the directory tree from the given directory to repo root
-        current_path = Path(directory)
-        repo_path = Path(self.repo_path)
-
-        while current_path != repo_path.parent:
-            gitignore_path = current_path / ".gitignore"
-            if gitignore_path.exists():
-                try:
-                    with open(gitignore_path, "r", encoding="utf-8") as f:
-                        patterns = f.readlines()
-                    if patterns:
-                        spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
-                        # Calculate relative path from repo root for proper matching
-                        rel_path_from_root = current_path.relative_to(repo_path)
-                        specs.append((spec, str(rel_path_from_root) if rel_path_from_root != Path(".") else ""))
-                except Exception as e:
-                    if self.verbose:
-                        logger.warning(f"Could not read .gitignore in {current_path}: {e}")
-
-            if current_path == repo_path:
-                break
-            current_path = current_path.parent
-
-        return specs
+            return None
+            
+        if directory in self.gitignore_cache:
+            return self.gitignore_cache[directory]
+        
+        # Check if this directory has a .gitignore
+        gitignore_path = os.path.join(directory, ".gitignore")
+        if os.path.exists(gitignore_path):
+            try:
+                with open(gitignore_path, "r", encoding="utf-8") as f:
+                    patterns = f.readlines()
+                if patterns:
+                    spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+                    self.gitignore_cache[directory] = spec
+                    return spec
+            except Exception as e:
+                if self.verbose:
+                    logger.warning(f"Could not read .gitignore in {directory}: {e}")
+        
+        # Cache None to avoid re-checking
+        self.gitignore_cache[directory] = None
+        return None
 
     def _matches_include(self, relative_path: str) -> bool:
         if not self.include_patterns:
@@ -203,6 +149,16 @@ class RepoProcessor:
         return False
 
     def is_ignored(self, relative_path: str, directory: str = None) -> bool:
+        """
+        Check if a file/directory should be ignored.
+        
+        Args:
+            relative_path: Path relative to repo root
+            directory: Absolute path to the parent directory (for nested gitignore lookup)
+            
+        Returns:
+            True if the path should be ignored
+        """
         # Always ignore .git directory
         if relative_path == ".git" or relative_path.startswith(".git" + os.sep):
             return True
@@ -211,22 +167,21 @@ class RepoProcessor:
         if os.path.abspath(os.path.join(self.repo_path, relative_path)) == self.output_file:
             return True
 
-        # Check nested gitignores if in a subdirectory
-        if directory and self.use_gitignore:
-            nested_specs = self._get_nested_gitignore_specs(directory)
-            for spec, base_path in nested_specs:
-                # Adjust relative_path for matching against nested gitignore
-                if base_path:
-                    # For nested gitignore, we need to match relative to the gitignore's directory
-                    # If relative_path is 'subdir/secret.txt' and gitignore is in 'subdir',
-                    # then we match 'secret.txt' against the gitignore in 'subdir'
-                    if relative_path.startswith(base_path + os.sep):
-                        adjusted_path = relative_path[len(base_path) + 1:]  # Remove 'subdir/' from 'subdir/secret.txt'
-                        if spec.match_file(adjusted_path):
-                            return True
-                else:
-                    # Root gitignore - match the full relative path
-                    if spec.match_file(relative_path):
+        # Check nested gitignore for the specific directory
+        if directory and self.use_gitignore and pathspec:
+            nested_spec = self._load_nested_gitignore(directory)
+            if nested_spec:
+                # For nested gitignore, match against the filename only (or relative to that dir)
+                filename = os.path.basename(relative_path)
+                if nested_spec.match_file(filename):
+                    return True
+                # Also try matching the relative path from that directory
+                if directory != self.repo_path:
+                    rel_from_dir = os.path.relpath(
+                        os.path.join(self.repo_path, relative_path), 
+                        directory
+                    )
+                    if nested_spec.match_file(rel_from_dir):
                         return True
 
         # Check root-level gitignore and user patterns
@@ -241,7 +196,7 @@ class RepoProcessor:
             with open(file_path, "rb") as f:
                 # Read first 8KB to check for binary content
                 chunk = f.read(8192)
-                # Check for null bytes or high proportion of non-text characters
+                # Check for null bytes
                 if b"\0" in chunk:
                     return True
                 # Try to decode as text - if it fails, it's likely binary
@@ -253,19 +208,70 @@ class RepoProcessor:
             return True
         return False
 
-    def _read_file_chunks(self, file_path: str, chunk_size: int = 8192) -> Generator[str, None, None]:
-        """Generator to read file in chunks to avoid memory issues."""
+    def generate_tree_structure(self) -> str:
+        """
+        Generate a text-based directory tree structure using the same ignore logic.
+
+        Returns:
+            String representation of the directory tree
+        """
+        tree_lines = ["--- REPOSITORY STRUCTURE ---"]
+
+        def _add_tree_item(item_path: Path, prefix: str = "", depth: int = 0):
+            # Use only the item name for display (not full relative path)
+            display_name = item_path.name
+            
+            rel_path = item_path.relative_to(self.repo_path).as_posix()
+            
+            # Use the same is_ignored logic as file processing
+            if self.is_ignored(rel_path, str(item_path.parent)):
+                return
+
+            if item_path.is_dir():
+                # Add directory
+                tree_lines.append(f"{prefix}├── {display_name}/")
+                
+                # Get children, filtering with is_ignored
+                try:
+                    children = sorted(
+                        [child for child in item_path.iterdir() 
+                         if not self.is_ignored(
+                             child.relative_to(self.repo_path).as_posix(),
+                             str(item_path)
+                         )],
+                        key=lambda x: (x.is_dir(), x.name.lower())
+                    )
+                except PermissionError:
+                    return
+                    
+                for i, child in enumerate(children):
+                    is_last = i == len(children) - 1
+                    new_prefix = prefix + ("    " if is_last else "│   ")
+                    _add_tree_item(child, new_prefix, depth + 1)
+            else:
+                # Add file
+                tree_lines.append(f"{prefix}├── {display_name}")
+
+        # Start with the root directory
+        root_path = Path(self.repo_path)
+        tree_lines.append(f"{root_path.name}/")
+        
         try:
-            with open(file_path, "r", encoding="utf-8", errors='replace') as f:
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
-        except Exception as e:
-            if self.verbose:
-                logger.error(f"Error reading file {file_path}: {e}")
-            raise
+            children = sorted(
+                [child for child in root_path.iterdir() 
+                 if not self.is_ignored(child.relative_to(root_path).as_posix(), str(root_path))],
+                key=lambda x: (x.is_dir(), x.name.lower())
+            )
+        except PermissionError:
+            children = []
+            
+        for i, child in enumerate(children):
+            is_last = i == len(children) - 1
+            prefix = "" if is_last else "│   "
+            _add_tree_item(child, prefix)
+
+        tree_lines.append("--- END REPOSITORY STRUCTURE ---\n")
+        return "\n".join(tree_lines)
 
     def process(self) -> int:
         processed_count = 0
@@ -282,7 +288,7 @@ class RepoProcessor:
             try:
                 # Write repository structure tree if requested
                 if self.include_tree and not self.dry_run:
-                    tree_structure = generate_tree_structure(self.repo_path)
+                    tree_structure = self.generate_tree_structure()
                     outfile.write(tree_structure)
 
                 # Walk through the repository
@@ -294,14 +300,14 @@ class RepoProcessor:
                     # Filter directories in-place
                     dirs_to_remove = []
                     for d in dirs:
-                        rel_d = os.path.join(rel_dir, d)
+                        rel_d = os.path.join(rel_dir, d) if rel_dir else d
                         if self.is_ignored(rel_d, root):
                             dirs_to_remove.append(d)
                     for d in dirs_to_remove:
                         dirs.remove(d)
 
                     for filename in sorted(files):
-                        rel_file = os.path.join(rel_dir, filename)
+                        rel_file = os.path.join(rel_dir, filename) if rel_dir else filename
 
                         if self.is_ignored(rel_file, root):
                             continue
@@ -310,7 +316,7 @@ class RepoProcessor:
                             continue
 
                         file_path = os.path.join(root, filename)
-                        
+
                         # Check file size
                         try:
                             file_size = os.path.getsize(file_path)
@@ -333,22 +339,19 @@ class RepoProcessor:
                                 processed_count += 1
                                 continue
 
-                            # Read and write file content
-                            file_content = ""
-                            for chunk in self._read_file_chunks(file_path):
-                                file_content += chunk
-
-                            # Write to output file
+                            # STREAM file content directly to output (memory efficient)
                             outfile.write(self.start_delimiter.format(path=rel_file) + "\n")
-                            outfile.write(file_content)
-                            if file_content and not file_content.endswith("\n"):
-                                outfile.write("\n")
+                            
+                            with open(file_path, "r", encoding="utf-8", errors='replace') as infile:
+                                for chunk in infile:
+                                    outfile.write(chunk)
+                                    if self.count_tokens:
+                                        self.total_tokens += get_tiktoken_token_count(chunk)
+                            
+                            # Ensure file ends with newline before end delimiter
+                            outfile.write("\n" if not outfile.tell() == 0 else "")
                             outfile.write(self.end_delimiter.format(path=rel_file) + "\n")
-                            
-                            # Count tokens if requested
-                            if self.count_tokens:
-                                self.total_tokens += get_tiktoken_token_count(file_content)
-                            
+
                             processed_count += 1
                         except (UnicodeDecodeError, PermissionError) as e:
                             if self.verbose:

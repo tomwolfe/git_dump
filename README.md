@@ -6,13 +6,15 @@ A robust CLI tool to concatenate the contents of a Git repository into a single 
 
 - **Respects .gitignore**: Automatically skips files ignored by Git (requires `pathspec`).
 - **Nested .gitignore Support**: Respects `.gitignore` files in subdirectories, not just the root.
+- **Unified Ignore Logic**: The directory tree and file dump use identical ignore rules, ensuring consistency.
 - **Binary File Detection**: Automatically skips binary files.
 - **Directory Tree Structure**: Generates a visual directory tree at the top of the output for better LLM context.
 - **Custom Patterns**: Include or exclude files using glob patterns.
 - **Flexible Output**: Specify custom output filenames and delimiters.
 - **Token Estimation**: Estimate token count for LLM context window management.
 - **Max File Size Filter**: Skip files larger than a specified size to avoid overwhelming LLM context windows.
-- **Stream Processing**: Memory-safe processing of large files using generators.
+- **Memory-Efficient Streaming**: Files are streamed directly to output without loading into memory.
+- **Gitignore Caching**: Nested `.gitignore` files are cached for fast lookup during traversal.
 - **Dry Run Mode**: See what would be processed without writing any files.
 - **Quiet Mode**: Reduce output for scripts and automation.
 
@@ -90,8 +92,13 @@ When using this tool for LLM context:
 To set up for development:
 
 ```bash
-pip install -e .[tiktoken]
-pip install pytest
+# Create a virtual environment
+python3 -m venv venv
+source venv/bin/activate  # On macOS/Linux
+# or: venv\Scripts\activate  # On Windows
+
+# Install with development dependencies
+pip install -e ".[tiktoken]" pytest
 ```
 
 Run tests:
