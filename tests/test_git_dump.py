@@ -1053,6 +1053,150 @@ max_file_size = 102400
             config_file=config_path,
             include_tree=False,
         )
-        
+
         # Config should have loaded ignore patterns
         assert "*.log" in processor.ignore_patterns or "temp/" in processor.ignore_patterns
+
+
+class TestFocusDir:
+    """Test --focus directory context pinning."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_focus_dir_full_content(self):
+        """Test that focus directory files get full content."""
+        self.create_file("src/main.py", "def main():\n    print('hello')")
+        self.create_file("src/utils.py", "def helper():\n    return 42")
+        self.create_file("tests/test_main.py", "def test_main():\n    assert True")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            focus_dir="src",
+            include_tree=False,
+            use_xml_format=False,
+        )
+        count = processor.process()
+
+        assert count == 3
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # All files should be present
+            assert "src/main.py" in content
+            assert "src/utils.py" in content
+            assert "tests/test_main.py" in content
+
+    def test_focus_dir_with_clean_mode(self):
+        """Test that focus directory files skip cleaning even if clean_mode is on."""
+        self.create_file("src/main.py", "# Comment\ndef main():\n    print('hello')")
+        self.create_file("tests/test_main.py", "# Test comment\ndef test():\n    pass")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            focus_dir="src",
+            clean_mode=True,
+            include_tree=False,
+            use_xml_format=False,
+        )
+        count = processor.process()
+
+        assert count == 2
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # Focus dir file should keep comments
+            assert "# Comment" in content
+            # Non-focus file should have comments removed
+            assert "# Test comment" not in content
+
+    def test_is_in_focus_dir_helper(self):
+        """Test the _is_in_focus_dir helper method."""
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            focus_dir="src",
+        )
+
+        assert processor._is_in_focus_dir("src/main.py") is True
+        assert processor._is_in_focus_dir("src/utils/helpers.py") is True
+        assert processor._is_in_focus_dir("src") is True
+        assert processor._is_in_focus_dir("tests/test.py") is False
+        assert processor._is_in_focus_dir("README.md") is False
+
+        # Test with nested focus dir
+        processor2 = RepoProcessor(
+            self.test_dir, self.output_file,
+            focus_dir="src/components",
+        )
+        assert processor2._is_in_focus_dir("src/components/button.py") is True
+        assert processor2._is_in_focus_dir("src/utils.py") is False
+
+
+class TestPrioritySortingEnhanced:
+    """Test enhanced priority sorting with type definitions."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_type_definition_files_prioritized(self):
+        """Test that type definition files are sorted first."""
+        self.create_file("types.py", "class Model: pass")
+        self.create_file("utils.py", "def helper(): pass")
+        self.create_file("main.py", "print('hello')")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            include_tree=False,
+            use_xml_format=False,
+        )
+        count = processor.process()
+
+        assert count == 3
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # types.py should be prioritized (appear before non-priority files like utils.py)
+            types_pos = content.find('### File: types.py')
+            utils_pos = content.find('### File: utils.py')
+            # types.py should come before utils.py
+            assert types_pos < utils_pos
+
+    def test_d_ts_files_prioritized(self):
+        """Test that .d.ts files are sorted first."""
+        self.create_file("index.d.ts", "export interface Foo {}")
+        self.create_file("helpers.ts", "export const x = 1")
+        self.create_file("utils.ts", "export const y = 2")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            include_tree=False,
+            use_xml_format=False,
+        )
+        count = processor.process()
+
+        assert count == 3
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # index.d.ts should be prioritized over regular .ts files
+            dts_pos = content.find('### File: index.d.ts')
+            helpers_pos = content.find('### File: helpers.ts')
+            utils_pos = content.find('### File: utils.ts')
+            # .d.ts file should come first (before non-priority .ts files)
+            assert dts_pos < helpers_pos and dts_pos < utils_pos

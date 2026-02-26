@@ -94,6 +94,7 @@ DEFAULT_IGNORE_PATTERNS: List[str] = [
 
 # Priority files to sort first (for better LLM context)
 PRIORITY_FILES: List[str] = [
+    # Documentation and project info
     'README.md',
     'README.rst',
     'README.txt',
@@ -102,17 +103,25 @@ PRIORITY_FILES: List[str] = [
     'LICENSE.md',
     'LICENSE.txt',
     'CONTRIBUTING.md',
+    # Python config and dependencies
     'pyproject.toml',
     'setup.py',
     'setup.cfg',
     'requirements.txt',
     'requirements-dev.txt',
+    'Pipfile',
+    'Pipfile.lock',
+    'poetry.lock',
+    # JavaScript/TypeScript config and dependencies
     'package.json',
     'package-lock.json',
     'yarn.lock',
+    'pnpm-lock.yaml',
     'tsconfig.json',
     'jsconfig.json',
+    # Other language configs
     'Cargo.toml',
+    'Cargo.lock',
     'go.mod',
     'go.sum',
     'Gemfile',
@@ -120,25 +129,62 @@ PRIORITY_FILES: List[str] = [
     'pom.xml',
     'build.gradle',
     'settings.gradle',
+    'gradle.properties',
     'CMakeLists.txt',
     'Makefile',
+    # Infrastructure and deployment
     'Dockerfile',
     'docker-compose.yml',
     'docker-compose.yaml',
+    '.dockerignore',
+    '.env.example',
+    '.env.template',
+    # Editor and tooling config
     '.gitignore',
     '.editorconfig',
+    '.eslintrc',
+    '.eslintrc.json',
+    '.eslintrc.js',
+    '.prettierrc',
+    '.prettierrc.json',
+    '.babelrc',
+    '.browserslistrc',
+    # Entry points and main files
     'main.py',
     'app.py',
     'index.py',
     'index.js',
     'index.ts',
+    'index.tsx',
     'main.js',
     'main.ts',
+    'main.tsx',
     'app.js',
     'app.ts',
+    'app.tsx',
     'src/main.py',
     'src/main.js',
     'src/main.ts',
+    # Interface and type definitions (high signal for understanding code structure)
+    'types.py',
+    'models.py',
+    'schemas.py',
+    'interfaces.ts',
+    'types.ts',
+    'type.ts',
+    'typings.ts',
+    'typings.d.ts',
+    'index.d.ts',
+    '*.d.ts',
+    'protocols.py',
+    'abc.py',
+    # Configuration modules
+    'config.py',
+    'settings.py',
+    'constants.py',
+    'config.ts',
+    'settings.ts',
+    'constants.ts',
 ]
 
 # LLM instructions header to prepend to output
@@ -376,6 +422,7 @@ class RepoProcessor:
         skeleton_mode: bool = False,  # New: Use tree-sitter for skeleton extraction
         skeleton_threshold: int = 1000,  # Token threshold for skeleton mode
         config_file: Optional[str] = None,  # New: Path to config file
+        focus_dir: Optional[str] = None,  # New: Focus directory for context pinning
     ):
         self.repo_path = Path(repo_path).resolve()
         self.output_file = Path(output_file).resolve()
@@ -398,6 +445,7 @@ class RepoProcessor:
         self.skeleton_mode = skeleton_mode
         self.skeleton_threshold = skeleton_threshold
         self.config_file = config_file
+        self.focus_dir = focus_dir
         self.total_tokens = 0
 
         # Set delimiters based on format choice
@@ -872,57 +920,97 @@ class RepoProcessor:
     def _extract_skeleton(self, content: str, lang: str) -> str:
         """
         Extract skeleton (function/class signatures) from code using tree-sitter.
-        
+
         Falls back to regex-based extraction if tree-sitter is not available.
-        
+
         Args:
             content: Original source code
             lang: Language identifier
-            
+
         Returns:
             Skeletonized version with function bodies removed
         """
         if not self.skeleton_mode:
             return content
-        
+
         # Try tree-sitter first
+        tree_sitter_success = False
         try:
             import tree_sitter
             from tree_sitter import Language
-            
+
             # Map language to tree-sitter grammar
+            # Try multiple loading strategies for better compatibility
             lang_map = {
-                'python': ('tree-sitter-python', 'python.so'),
-                'javascript': ('tree-sitter-javascript', 'javascript.so'),
-                'typescript': ('tree-sitter-typescript', 'typescript.so'),
+                'python': ('tree-sitter-python', 'python', ['python.so', 'build/python.so']),
+                'javascript': ('tree-sitter-javascript', 'javascript', ['javascript.so', 'build/javascript.so']),
+                'typescript': ('tree-sitter-typescript', 'typescript', ['typescript.so', 'build/typescript.so']),
             }
-            
+
             if lang not in lang_map:
                 return self._extract_skeleton_regex(content, lang)
-            
-            # Try to load the language grammar
+
+            pkg_name, ts_lang_name, lib_paths = lang_map[lang]
+
+            # Try to load the language grammar using multiple strategies
             try:
-                ts_lang = Language(lang_map[lang][1], lang_map[lang][0].replace('tree-sitter-', ''))
-                parser = tree_sitter.Parser()
-                parser.set_language(ts_lang)
-                
-                # Parse the code
-                tree = parser.parse(content.encode())
-                
-                # Extract skeleton based on language
-                if lang == 'python':
-                    return self._extract_python_skeleton(tree, content)
-                elif lang in ('javascript', 'typescript'):
-                    return self._extract_js_skeleton(tree, content)
-                    
+                # Strategy 1: Try tree-sitter-languages package (easiest if available)
+                try:
+                    from tree_sitter_languages import get_language, get_parser
+                    ts_lang = get_language(ts_lang_name)
+                    parser = get_parser(ts_lang_name)
+                    tree = parser.parse(content.encode())
+                    tree_sitter_success = True
+                except (ImportError, Exception):
+                    pass
+
+                # Strategy 2: Try direct .so file loading
+                if not tree_sitter_success:
+                    for lib_path in lib_paths:
+                        try:
+                            ts_lang = Language(lib_path, ts_lang_name)
+                            parser = tree_sitter.Parser()
+                            parser.set_language(ts_lang)
+                            tree = parser.parse(content.encode())
+                            tree_sitter_success = True
+                            break
+                        except Exception:
+                            continue
+
+                # Strategy 3: Try loading from site-packages
+                if not tree_sitter_success:
+                    try:
+                        import site
+                        for site_pkg in site.getsitepackages():
+                            for lib_path in lib_paths:
+                                full_path = os.path.join(site_pkg, lib_path)
+                                if os.path.exists(full_path):
+                                    ts_lang = Language(full_path, ts_lang_name)
+                                    parser = tree_sitter.Parser()
+                                    parser.set_language(ts_lang)
+                                    tree = parser.parse(content.encode())
+                                    tree_sitter_success = True
+                                    break
+                            if tree_sitter_success:
+                                break
+                    except Exception:
+                        pass
+
+                # Extract skeleton if tree-sitter worked
+                if tree_sitter_success:
+                    if lang == 'python':
+                        return self._extract_python_skeleton(tree, content)
+                    elif lang in ('javascript', 'typescript'):
+                        return self._extract_js_skeleton(tree, content)
+
             except Exception:
                 # Fall back to regex if tree-sitter fails
                 pass
-                
+
         except ImportError:
             pass
-        
-        # Fallback to regex-based extraction
+
+        # Fallback to regex-based extraction (surprisingly robust)
         return self._extract_skeleton_regex(content, lang)
 
     def _extract_python_skeleton(self, tree, content: str) -> str:
@@ -1228,6 +1316,13 @@ class RepoProcessor:
             if file in PRIORITY_FILES:
                 return (0, PRIORITY_FILES.index(file))
 
+            # Check for pattern matches (e.g., *.d.ts)
+            for pattern in PRIORITY_FILES:
+                if pattern.startswith('*.'):
+                    ext = pattern[1:]  # Get .d.ts from *.d.ts
+                    if file.endswith(ext):
+                        return (0, PRIORITY_FILES.index(pattern))
+
             # Non-priority files come after, sorted alphabetically
             return (1, file.lower())
 
@@ -1359,23 +1454,34 @@ class RepoProcessor:
     def _calculate_token_budget(self, files: List[Tuple[Path, str]]) -> Dict[str, any]:
         """
         Calculate token budget and determine processing strategy for each file.
-        
+
         Implements multi-pass approach:
         1. Calculate tokens for all files
         2. If total > max_tokens, mark non-priority files for cleaning
         3. If still > max_tokens, mark non-priority files for skeleton mode
         4. Only as last resort, exclude files based on depth
-        
+
+        If focus_dir is set, files in that directory get priority treatment.
+
         Args:
             files: List of (path, rel_path) tuples
-            
+
         Returns:
             Dict with processing instructions for each file
         """
         if not self.max_tokens:
             # No budget constraint - process all files normally
+            # But still apply focus_dir logic if set
+            if self.focus_dir:
+                return {
+                    rel_path: {
+                        'action': 'focus' if self._is_in_focus_dir(rel_path) else 'full',
+                        'path': path
+                    }
+                    for path, rel_path in files
+                }
             return {rel_path: {'action': 'full', 'path': path} for path, rel_path in files}
-        
+
         # First pass: estimate tokens for all files (without reading content)
         file_estimates = []
         for path, rel_path in files:
@@ -1384,38 +1490,47 @@ class RepoProcessor:
                 est_tokens = estimate_tokens(str(size))  # Rough estimate based on size
             except (OSError, PermissionError):
                 est_tokens = 0
-            
-            # Check if priority file
-            is_priority = (rel_path in PRIORITY_FILES or 
+
+            # Check if priority file or in focus directory
+            is_priority = (rel_path in PRIORITY_FILES or
                           Path(rel_path).name in PRIORITY_FILES)
-            
+            in_focus = self._is_in_focus_dir(rel_path)
+
             # Calculate depth (deeper files are less important)
             depth = len(Path(rel_path).parts)
-            
+
             file_estimates.append({
                 'path': path,
                 'rel_path': rel_path,
                 'est_tokens': est_tokens,
                 'is_priority': is_priority,
+                'in_focus': in_focus,
                 'depth': depth,
             })
-        
-        # Sort by priority (priority files first, then by depth)
-        file_estimates.sort(key=lambda x: (not x['is_priority'], x['depth']))
-        
+
+        # Sort by priority (focus/priority files first, then by depth)
+        file_estimates.sort(key=lambda x: (not x['in_focus'], not x['is_priority'], x['depth']))
+
         # Second pass: determine action for each file
         result = {}
         running_total = 0
         budget_remaining = self.max_tokens
-        
+
         # Reserve 10% of budget for delimiters and tree
         budget_remaining = int(budget_remaining * 0.9)
-        
+
         for file_info in file_estimates:
             rel_path = file_info['rel_path']
             est_tokens = file_info['est_tokens']
             is_priority = file_info['is_priority']
-            
+            in_focus = file_info['in_focus']
+
+            # Focus directory files get full treatment always
+            if in_focus:
+                result[rel_path] = {'action': 'focus', 'path': file_info['path']}
+                running_total += est_tokens
+                continue
+
             if running_total + est_tokens <= budget_remaining:
                 # Can include full file
                 result[rel_path] = {'action': 'full', 'path': file_info['path']}
@@ -1433,8 +1548,29 @@ class RepoProcessor:
                 result[rel_path] = {'action': 'full', 'path': file_info['path']}
                 running_total += est_tokens
             # else: exclude file (don't add to result)
-        
+
         return result
+
+    def _is_in_focus_dir(self, rel_path: str) -> bool:
+        """
+        Check if a file is within the focus directory.
+
+        Args:
+            rel_path: Relative path to the file
+
+        Returns:
+            True if the file is in the focus directory
+        """
+        if not self.focus_dir:
+            return False
+
+        # Normalize paths
+        focus_normalized = self.focus_dir.replace('\\', '/').rstrip('/')
+        rel_path_normalized = rel_path.replace('\\', '/')
+
+        # Check if file is in focus directory or is the focus directory itself
+        return (rel_path_normalized.startswith(focus_normalized + '/') or
+                rel_path_normalized == focus_normalized)
 
     def generate_tree_structure(self) -> str:
         """
@@ -1525,12 +1661,15 @@ class RepoProcessor:
 
                 # Collect all files first for token budgeting
                 all_files = list(self.get_valid_files())
-                
+
                 # Calculate token budget strategy if max_tokens is set
                 if self.max_tokens and not self.dry_run:
                     file_strategy = self._calculate_token_budget(all_files)
+                elif self.focus_dir and not self.dry_run:
+                    # Apply focus_dir logic even without max_tokens constraint
+                    file_strategy = self._calculate_token_budget(all_files)
                 else:
-                    file_strategy = {rel_path: {'action': 'full', 'path': path} 
+                    file_strategy = {rel_path: {'action': 'full', 'path': path}
                                     for path, rel_path in all_files}
 
                 # Process files according to strategy
@@ -1578,6 +1717,10 @@ class RepoProcessor:
                         self.clean_mode = True
                         content = self._clean_content(content, lang)
                         self.clean_mode = original_clean
+                    elif action == 'focus':
+                        # Focus directory: always include full content, skip cleaning
+                        # Even if clean_mode is enabled globally
+                        pass  # Use content as-is
                     elif self.clean_mode:
                         # Global clean_mode is enabled but strategy is 'full'
                         # Still apply cleaning

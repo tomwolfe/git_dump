@@ -122,6 +122,10 @@ def main():
         "--config", type=str, default=None,
         help="Path to config file (default: looks for .gitdumprc.toml in repo root)"
     )
+    parser.add_argument(
+        "--focus", type=str, default=None,
+        help="Focus directory: include full content for this directory, skeletonize others"
+    )
 
     args = parser.parse_args()
 
@@ -162,6 +166,7 @@ def main():
         skeleton_mode=args.skeleton_mode,
         skeleton_threshold=args.skeleton_threshold,
         config_file=config_path,
+        focus_dir=args.focus,
     )
 
     if args.verbose:
