@@ -152,41 +152,47 @@ class RepoProcessor:
         """
         Check if a file/directory should be ignored.
         
+        Implements cumulative gitignore logic: checks all .gitignore files
+        from the repo root down to the file's directory.
+
         Args:
-            relative_path: Path relative to repo root
+            relative_path: Path relative to repo root (using forward slashes)
             directory: Absolute path to the parent directory (for nested gitignore lookup)
-            
+
         Returns:
             True if the path should be ignored
         """
         # Always ignore .git directory
-        if relative_path == ".git" or relative_path.startswith(".git" + os.sep):
+        parts = relative_path.replace('\\', '/').split('/')
+        if '.git' in parts:
             return True
 
         # Ignore the output file if it's within the repo path
         if os.path.abspath(os.path.join(self.repo_path, relative_path)) == self.output_file:
             return True
 
-        # Check nested gitignore for the specific directory
-        if directory and self.use_gitignore and pathspec:
-            nested_spec = self._load_nested_gitignore(directory)
-            if nested_spec:
-                # For nested gitignore, match against the filename only (or relative to that dir)
-                filename = os.path.basename(relative_path)
-                if nested_spec.match_file(filename):
-                    return True
-                # Also try matching the relative path from that directory
-                if directory != self.repo_path:
-                    rel_from_dir = os.path.relpath(
-                        os.path.join(self.repo_path, relative_path), 
-                        directory
-                    )
-                    if nested_spec.match_file(rel_from_dir):
-                        return True
-
-        # Check root-level gitignore and user patterns
+        # Check root-level spec and custom ignore patterns
         if self.spec and self.spec.match_file(relative_path):
             return True
+
+        # Cumulative nested check: Check every .gitignore from root to the file
+        if self.use_gitignore and pathspec:
+            # Normalize path to use forward slashes
+            target_rel = relative_path.replace('\\', '/')
+            
+            # Check each parent directory for a .gitignore
+            path_parts = target_rel.split('/')
+            for i in range(len(path_parts) - 1):  # -1 to exclude the file itself
+                # Build the parent directory path
+                parent_rel = '/'.join(path_parts[:i+1])
+                abs_parent = os.path.join(self.repo_path, parent_rel)
+                
+                nested_spec = self._load_nested_gitignore(abs_parent)
+                if nested_spec:
+                    # Match relative to the directory where .gitignore lives
+                    rel_to_gitignore = '/'.join(path_parts[i+1:])
+                    if nested_spec.match_file(rel_to_gitignore):
+                        return True
 
         return False
 
@@ -208,68 +214,79 @@ class RepoProcessor:
             return True
         return False
 
+    def _should_include_in_tree(self, item_path: Path) -> bool:
+        """
+        Check if a file or directory should appear in the tree.
+        
+        For files, also checks binary and size limits to ensure tree parity
+        with the actual dump content.
+        
+        Args:
+            item_path: Absolute path to the item
+            
+        Returns:
+            True if the item should appear in the tree
+        """
+        rel_path = item_path.relative_to(self.repo_path).as_posix()
+        
+        # First check if ignored
+        if self.is_ignored(rel_path, str(item_path.parent)):
+            return False
+        
+        # For files, also check binary and size for perfect parity with dump
+        if item_path.is_file():
+            try:
+                if item_path.stat().st_size > self.max_file_size:
+                    return False
+                if self._is_binary(str(item_path)):
+                    return False
+            except (OSError, PermissionError):
+                return False
+        
+        return True
+
     def generate_tree_structure(self) -> str:
         """
         Generate a text-based directory tree structure using the same ignore logic.
+        Uses proper tree characters (└── for last item, ├── for others).
 
         Returns:
             String representation of the directory tree
         """
         tree_lines = ["--- REPOSITORY STRUCTURE ---"]
 
-        def _add_tree_item(item_path: Path, prefix: str = "", depth: int = 0):
-            # Use only the item name for display (not full relative path)
-            display_name = item_path.name
-            
-            rel_path = item_path.relative_to(self.repo_path).as_posix()
-            
-            # Use the same is_ignored logic as file processing
-            if self.is_ignored(rel_path, str(item_path.parent)):
-                return
-
-            if item_path.is_dir():
-                # Add directory
-                tree_lines.append(f"{prefix}├── {display_name}/")
+        def _build_tree(current_path: Path, prefix: str = ""):
+            try:
+                # Get all entries sorted with dirs last
+                entries = sorted(
+                    list(current_path.iterdir()),
+                    key=lambda x: (not x.is_dir(), x.name.lower())
+                )
                 
-                # Get children, filtering with is_ignored
-                try:
-                    children = sorted(
-                        [child for child in item_path.iterdir() 
-                         if not self.is_ignored(
-                             child.relative_to(self.repo_path).as_posix(),
-                             str(item_path)
-                         )],
-                        key=lambda x: (x.is_dir(), x.name.lower())
-                    )
-                except PermissionError:
-                    return
+                # Pre-filter entries to only show what will actually be processed
+                valid_entries = []
+                for entry in entries:
+                    if self._should_include_in_tree(entry):
+                        valid_entries.append(entry)
+
+                for i, entry in enumerate(valid_entries):
+                    is_last = i == len(valid_entries) - 1
+                    char = "└── " if is_last else "├── "
                     
-                for i, child in enumerate(children):
-                    is_last = i == len(children) - 1
-                    new_prefix = prefix + ("    " if is_last else "│   ")
-                    _add_tree_item(child, new_prefix, depth + 1)
-            else:
-                # Add file
-                tree_lines.append(f"{prefix}├── {display_name}")
+                    if entry.is_dir():
+                        tree_lines.append(f"{prefix}{char}{entry.name}/")
+                        new_prefix = prefix + ("    " if is_last else "│   ")
+                        _build_tree(entry, new_prefix)
+                    else:
+                        tree_lines.append(f"{prefix}{char}{entry.name}")
+            except PermissionError:
+                tree_lines.append(f"{prefix}└── [Permission Denied]")
 
         # Start with the root directory
         root_path = Path(self.repo_path)
         tree_lines.append(f"{root_path.name}/")
-        
-        try:
-            children = sorted(
-                [child for child in root_path.iterdir() 
-                 if not self.is_ignored(child.relative_to(root_path).as_posix(), str(root_path))],
-                key=lambda x: (x.is_dir(), x.name.lower())
-            )
-        except PermissionError:
-            children = []
-            
-        for i, child in enumerate(children):
-            is_last = i == len(children) - 1
-            prefix = "" if is_last else "│   "
-            _add_tree_item(child, prefix)
 
+        _build_tree(root_path)
         tree_lines.append("--- END REPOSITORY STRUCTURE ---\n")
         return "\n".join(tree_lines)
 
