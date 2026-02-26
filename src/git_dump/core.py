@@ -543,9 +543,9 @@ class RepoProcessor:
 
         return "[Error: Could not decode file with any supported encoding]"
 
-    def _clean_content(self, content: str) -> str:
+    def _clean_content(self, content: str, lang: str = '') -> str:
         """
-        Clean content to reduce token count.
+        Clean content to reduce token count using language-aware rules.
 
         Removes:
         - Excessive blank lines (more than 2 consecutive)
@@ -555,6 +555,7 @@ class RepoProcessor:
 
         Args:
             content: Original file content
+            lang: Language identifier (e.g., 'python', 'javascript')
 
         Returns:
             Cleaned content with reduced token count
@@ -567,17 +568,21 @@ class RepoProcessor:
         in_multiline_comment = False
         prev_blank_count = 0
 
-        # Detect language from file extension patterns in content
-        # This is a simple heuristic - could be improved
-        is_python = any(line.strip().startswith('#') for line in lines[:10])
-        is_js_ts = any(
-            'function' in line or 'const ' in line or 'let ' in line or 'import ' in line
-            for line in lines[:10]
-        )
-        is_c_style = any(
-            'void ' in line or 'int ' in line or '#include' in line
-            for line in lines[:10]
-        )
+        # Detect language from extension or content heuristics
+        if not lang:
+            is_python = any(line.strip().startswith('#') for line in lines[:10])
+            is_js_ts = any(
+                'function' in line or 'const ' in line or 'let ' in line or 'import ' in line
+                for line in lines[:10]
+            )
+            is_c_style = any(
+                'void ' in line or 'int ' in line or '#include' in line
+                for line in lines[:10]
+            )
+        else:
+            is_python = lang == 'python'
+            is_js_ts = lang in ('javascript', 'typescript')
+            is_c_style = lang in ('c', 'cpp', 'java', 'go', 'rust')
 
         for line in lines:
             # Handle multi-line comments
@@ -591,23 +596,18 @@ class RepoProcessor:
             # Remove single-line comments based on language
             if is_python:
                 # Python: remove # comments but keep shebangs and encoding declarations
-                if '#' in line and not line.strip().startswith('#!') and not 'coding:' in line:
-                    # Only remove if # is not in a string (simple heuristic)
-                    if "'" not in line and '"' not in line:
-                        line = line.split('#')[0]
-                # Python docstrings are harder to detect - skip for now
+                if '#' in line and not line.strip().startswith('#!') and 'coding:' not in line:
+                    # Use state machine to check if # is in a string
+                    line = self._remove_python_comment(line)
             elif is_js_ts or is_c_style:
-                # Remove // comments
+                # Remove // comments with string-aware logic
                 if '//' in line:
-                    # Check it's not in a string (simple heuristic)
-                    before_slash = line.split('//')[0]
-                    if before_slash.count('"') % 2 == 0 and before_slash.count("'") % 2 == 0:
-                        line = before_slash
+                    line = self._remove_cpp_style_comment(line)
 
                 # Check for /* start of multi-line comment
                 if '/*' in line:
                     if '*/' in line:
-                        # Single-line block comment
+                        # Single-line block comment - use regex to remove
                         line = re.sub(r'/\*.*?\*/', '', line)
                     else:
                         # Start of multi-line comment
@@ -621,6 +621,123 @@ class RepoProcessor:
             if not line.strip():
                 prev_blank_count += 1
                 if prev_blank_count <= 2:  # Allow up to 2 consecutive blank lines
+                    cleaned_lines.append(line)
+            else:
+                prev_blank_count = 0
+                cleaned_lines.append(line)
+
+        return '\n'.join(cleaned_lines)
+
+    def _remove_python_comment(self, line: str) -> str:
+        """
+        Remove Python # comment safely, respecting strings.
+
+        Uses a simple state machine to track whether we're inside a string.
+        """
+        in_single = False
+        in_double = False
+        in_triple_single = False
+        in_triple_double = False
+        i = 0
+
+        while i < len(line):
+            # Check for triple quotes first
+            if i <= len(line) - 3:
+                triple_single = line[i:i+3]
+                triple_double = line[i:i+3]
+                if triple_single == "'''" and not in_double and not in_triple_double:
+                    in_triple_single = not in_triple_single
+                    i += 3
+                    continue
+                if triple_double == '"""' and not in_single and not in_triple_single:
+                    in_triple_double = not in_triple_double
+                    i += 3
+                    continue
+
+            # Check for escape sequences
+            if i < len(line) - 1 and line[i] == '\\':
+                i += 2  # Skip escaped character
+                continue
+
+            # Track string delimiters (only if not in triple-quoted string)
+            if not in_triple_single and not in_triple_double:
+                if line[i] == "'" and not in_double:
+                    in_single = not in_single
+                elif line[i] == '"' and not in_single:
+                    in_double = not in_double
+
+            # Check for comment (only if not in any string)
+            if line[i] == '#' and not in_single and not in_double and not in_triple_single and not in_triple_double:
+                return line[:i]
+
+            i += 1
+
+        return line
+
+    def _remove_cpp_style_comment(self, line: str) -> str:
+        """
+        Remove C++/JS // comment safely, respecting strings.
+
+        Uses a simple state machine to track whether we're inside a string.
+        """
+        in_single = False
+        in_double = False
+        in_template = False
+        i = 0
+
+        while i < len(line):
+            # Check for escape sequences
+            if i < len(line) - 1 and line[i] == '\\':
+                i += 2  # Skip escaped character
+                continue
+
+            # Track string delimiters
+            if line[i] == "'" and not in_double and not in_template:
+                in_single = not in_single
+            elif line[i] == '"' and not in_single and not in_template:
+                in_double = not in_double
+            elif line[i] == '`' and not in_single and not in_double:
+                in_template = not in_template  # Template literals in JS
+
+            # Check for // comment (only if not in any string)
+            if (i < len(line) - 1 and line[i:i+2] == '//' and
+                not in_single and not in_double and not in_template):
+                return line[:i]
+
+            i += 1
+
+        return line
+
+    def _clean_content_chunk(self, chunk: str) -> str:
+        """
+        Clean a chunk of content (for streaming mode).
+
+        This is a simplified version of _clean_content that works on chunks.
+        Note: Multi-line comments may not be perfectly handled across chunk boundaries.
+
+        Args:
+            chunk: A chunk of file content
+
+        Returns:
+            Cleaned chunk
+        """
+        if not self.clean_mode:
+            return chunk
+
+        # For chunked cleaning, we use line-by-line processing
+        # Multi-line comments spanning chunks will be partially cleaned
+        lines = chunk.splitlines(keepends=True)
+        cleaned_lines = []
+        prev_blank_count = 0
+
+        for line in lines:
+            # Strip trailing whitespace
+            line = line.rstrip()
+
+            # Track consecutive blank lines
+            if not line.strip():
+                prev_blank_count += 1
+                if prev_blank_count <= 2:
                     cleaned_lines.append(line)
             else:
                 prev_blank_count = 0
@@ -758,12 +875,87 @@ class RepoProcessor:
 
         return sorted(files, key=get_priority)
 
+    def _is_valid_file(self, file_path: Path) -> bool:
+        """
+        Check if a file should be included in the dump.
+
+        Checks:
+        - Not ignored by gitignore/rules
+        - Not binary
+        - Within size limit
+        - Matches include patterns
+
+        Args:
+            file_path: Absolute path to the file
+
+        Returns:
+            True if the file should be included
+        """
+        rel_path = file_path.relative_to(self.repo_path).as_posix()
+
+        # Check ignore rules
+        if self.is_ignored(rel_path, file_path.parent):
+            return False
+
+        # Check include patterns
+        if not self._matches_include(rel_path):
+            return False
+
+        # Check size
+        try:
+            if file_path.stat().st_size > self.max_file_size:
+                return False
+        except (OSError, PermissionError):
+            return False
+
+        # Check binary
+        try:
+            if self._is_binary(file_path):
+                return False
+        except (OSError, PermissionError):
+            return False
+
+        return True
+
+    def get_valid_files(self) -> Generator[Tuple[Path, str], None, None]:
+        """
+        Generator that yields all valid files to process.
+
+        This is the single source of truth for file selection, used by both
+        the tree generator and the dump processor to ensure perfect parity.
+
+        Yields:
+            Tuples of (absolute_path, relative_path_str)
+        """
+        for root, dirs, files in os.walk(self.repo_path):
+            rel_dir = os.path.relpath(root, self.repo_path)
+            if rel_dir == ".":
+                rel_dir = ""
+
+            # Filter directories in-place (performance optimization)
+            dirs_to_remove = []
+            for d in dirs:
+                rel_d = os.path.join(rel_dir, d) if rel_dir else d
+                if self.is_ignored(rel_d, Path(root)):
+                    dirs_to_remove.append(d)
+            for d in dirs_to_remove:
+                dirs.remove(d)
+
+            # Sort files with priority files first
+            dir_files = self._sort_files(files, rel_dir)
+
+            for filename in dir_files:
+                rel_file = os.path.join(rel_dir, filename) if rel_dir else filename
+                file_path = Path(root) / filename
+
+                if self._is_valid_file(file_path):
+                    yield (file_path, rel_file)
+
     def _should_include_in_tree(self, item_path: Path) -> bool:
         """
         Check if a file or directory should appear in the tree.
 
-        For files, also checks binary and size limits to ensure tree parity
-        with the actual dump content.
+        For files, uses _is_valid_file for perfect parity with dump.
 
         Args:
             item_path: Absolute path to the item
@@ -771,27 +963,31 @@ class RepoProcessor:
         Returns:
             True if the item should appear in the tree
         """
-        rel_path = item_path.relative_to(self.repo_path).as_posix()
+        if item_path.is_file():
+            return self._is_valid_file(item_path)
 
-        # First check if ignored
+        # For directories, check if they contain any valid files
+        rel_path = item_path.relative_to(self.repo_path).as_posix()
         if self.is_ignored(rel_path, item_path.parent):
             return False
 
-        # For files, also check binary and size for perfect parity with dump
-        if item_path.is_file():
-            try:
-                if item_path.stat().st_size > self.max_file_size:
-                    return False
-                if self._is_binary(item_path):
-                    return False
-            except (OSError, PermissionError):
-                return False
+        # Check if directory has any valid files (recursively)
+        try:
+            for entry in item_path.iterdir():
+                if entry.is_file():
+                    if self._is_valid_file(entry):
+                        return True
+                elif entry.is_dir():
+                    if self._should_include_in_tree(entry):
+                        return True
+        except (PermissionError, OSError):
+            return False
 
-        return True
+        return False
 
     def generate_tree_structure(self) -> str:
         """
-        Generate a text-based directory tree structure using the same ignore logic.
+        Generate a text-based directory tree structure using the unified file generator.
         Uses proper tree characters (└── for last item, ├── for others).
 
         Returns:
@@ -799,18 +995,31 @@ class RepoProcessor:
         """
         tree_lines = ["--- REPOSITORY STRUCTURE ---"]
 
+        # Build a set of all valid file paths for quick lookup
+        valid_files = set()
+        dirs_with_files = set()
+
+        for file_path, rel_path in self.get_valid_files():
+            valid_files.add(rel_path)
+            # Track all parent directories
+            parent = file_path.parent
+            while parent != self.repo_path:
+                dirs_with_files.add(parent.relative_to(self.repo_path).as_posix())
+                parent = parent.parent
+
         def _build_tree(current_path: Path, prefix: str = ""):
             try:
-                # Get all entries sorted with dirs last
                 entries = sorted(
                     list(current_path.iterdir()),
                     key=lambda x: (not x.is_dir(), x.name.lower())
                 )
 
-                # Pre-filter entries to only show what will actually be processed
                 valid_entries = []
                 for entry in entries:
-                    if self._should_include_in_tree(entry):
+                    rel_entry = entry.relative_to(self.repo_path).as_posix()
+                    if entry.is_file() and rel_entry in valid_files:
+                        valid_entries.append(entry)
+                    elif entry.is_dir() and (rel_entry in dirs_with_files or self._should_include_in_tree(entry)):
                         valid_entries.append(entry)
 
                 for i, entry in enumerate(valid_entries):
@@ -836,14 +1045,12 @@ class RepoProcessor:
 
     def process(self) -> int:
         processed_count = 0
-        output_content = []
 
         # Set up git worktree if branch/commit specified
         self._setup_git_worktree()
 
-        if self.dry_run:
-            if self.verbose:
-                logger.info("Dry run mode: No files will be written.")
+        if self.dry_run and self.verbose:
+            logger.info("Dry run mode: No files will be written.")
 
         try:
             if self.dry_run:
@@ -865,125 +1072,113 @@ class RepoProcessor:
                     if self.count_tokens:
                         self.total_tokens += get_tiktoken_token_count(tree_structure)
 
-                # Walk through the repository
-                for root, dirs, files in os.walk(self.repo_path):
-                    rel_dir = os.path.relpath(root, self.repo_path)
-                    if rel_dir == ".":
-                        rel_dir = ""
+                # Use unified generator for perfect tree-dump parity
+                for file_path, rel_file in self.get_valid_files():
+                    if self.dry_run:
+                        if self.verbose:
+                            logger.info(f"Would process: {rel_file}")
+                        processed_count += 1
+                        continue
 
-                    # Filter directories in-place (performance optimization)
-                    dirs_to_remove = []
-                    for d in dirs:
-                        rel_d = os.path.join(rel_dir, d) if rel_dir else d
-                        if self.is_ignored(rel_d, Path(root)):
-                            dirs_to_remove.append(d)
-                    for d in dirs_to_remove:
-                        dirs.remove(d)
+                    # Build delimiter with language hint for markdown
+                    lang = get_language_from_path(rel_file)
+                    start_header = self.start_delimiter.format(path=rel_file, lang=lang)
+                    end_footer = self.end_delimiter.format(path=rel_file, lang=lang)
 
-                    # Sort files with priority files first
-                    files = self._sort_files(files, rel_dir)
+                    # Write start delimiter and count tokens
+                    outfile.write(start_header + "\n")
+                    if self.count_tokens:
+                        self.total_tokens += get_tiktoken_token_count(start_header + "\n")
 
-                    for filename in files:
-                        rel_file = os.path.join(rel_dir, filename) if rel_dir else filename
-
-                        if self.is_ignored(rel_file, Path(root)):
-                            continue
-
-                        if not self._matches_include(rel_file):
-                            continue
-
-                        file_path = Path(root) / filename
-
-                        # Check file size
-                        try:
-                            file_size = file_path.stat().st_size
-                            if file_size > self.max_file_size:
-                                if self.verbose:
-                                    logger.warning(f"Skipping {rel_file} - exceeds max size ({file_size} > {self.max_file_size})")
-                                continue
-                        except OSError:
+                    # For clean_mode, we need to read the whole file to properly handle comments
+                    # For non-clean mode, we can truly stream in chunks
+                    if self.clean_mode:
+                        # Read entire file for language-aware cleaning
+                        content = self._read_file_safely(file_path)
+                        if content.startswith("[Error:"):
                             if self.verbose:
-                                logger.warning(f"Could not get size for {rel_file}, skipping")
+                                logger.warning(f"Skipping '{rel_file}' - {content}")
+                            # Undo the start delimiter tokens
+                            if self.count_tokens:
+                                self.total_tokens -= get_tiktoken_token_count(start_header + "\n")
                             continue
 
-                        try:
-                            if self._is_binary(file_path):
-                                continue
+                        # Clean with language awareness
+                        content = self._clean_content(content, lang)
 
-                            if self.dry_run:
-                                if self.verbose:
-                                    logger.info(f"Would process: {rel_file}")
-                                processed_count += 1
-                                continue
-
-                            # Build delimiter with language hint for markdown
-                            lang = get_language_from_path(rel_file)
-                            start_header = self.start_delimiter.format(path=rel_file, lang=lang)
-                            end_footer = self.end_delimiter.format(path=rel_file, lang=lang)
-
-                            # Write start delimiter and count tokens
-                            outfile.write(start_header + "\n")
-                            if self.count_tokens:
-                                self.total_tokens += get_tiktoken_token_count(start_header + "\n")
-
-                            # Read file content with robust encoding fallback
-                            content = self._read_file_safely(file_path)
-                            if content.startswith("[Error:"):
-                                if self.verbose:
-                                    logger.warning(f"Skipping '{rel_file}' - {content}")
-                                continue
-
-                            # Clean content if requested
-                            if self.clean_mode:
-                                content = self._clean_content(content)
-
-                            # Check max_tokens before writing content
-                            if self.max_tokens:
-                                content_tokens = get_tiktoken_token_count(content)
-                                if self.total_tokens + content_tokens > self.max_tokens:
-                                    logger.warning(f"Token limit reached. Stopping dump at '{rel_file}'.")
-                                    # Write end delimiter for incomplete file
-                                    outfile.write("\n")
-                                    outfile.write(end_footer + "\n")
-                                    if self.count_tokens:
-                                        self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
-                                    processed_count += 1
-                                    break
-
-                            # STREAM file content to output (memory efficient for large files)
-                            # Write in chunks to avoid loading entire file into memory for token counting
-                            chunk_size = 8192
-                            for i in range(0, len(content), chunk_size):
-                                chunk = content[i:i + chunk_size]
-                                outfile.write(chunk)
+                        # Check max_tokens before writing
+                        if self.max_tokens:
+                            content_tokens = get_tiktoken_token_count(content)
+                            if self.total_tokens + content_tokens > self.max_tokens:
+                                logger.warning(f"Token limit reached. Stopping dump at '{rel_file}'.")
+                                outfile.write("\n")
+                                outfile.write(end_footer + "\n")
                                 if self.count_tokens:
-                                    self.total_tokens += get_tiktoken_token_count(chunk)
+                                    self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
+                                processed_count += 1
+                                break
 
-                                # Check token limit during streaming
-                                if self.max_tokens and self.total_tokens >= self.max_tokens:
-                                    logger.warning(f"Token limit reached mid-file at '{rel_file}'.")
-                                    break
+                        # Write cleaned content
+                        outfile.write(content)
+                        if self.count_tokens:
+                            self.total_tokens += get_tiktoken_token_count(content)
+                    else:
+                        # True streaming mode - read and write in chunks
+                        chunk_size = 16384  # 16KB chunks
+                        encoding_errors_handled = False
+                        file_stopped_early = False
 
-                            # Ensure file ends with newline before end delimiter
+                        for enc in ['utf-8-sig', 'utf-8', 'latin-1']:
+                            try:
+                                with open(file_path, "r", encoding=enc, errors='replace') as f_in:
+                                    while True:
+                                        chunk = f_in.read(chunk_size)
+                                        if not chunk:
+                                            break
+
+                                        outfile.write(chunk)
+
+                                        # Count tokens incrementally
+                                        if self.count_tokens:
+                                            self.total_tokens += get_tiktoken_token_count(chunk)
+
+                                        # Check token limit during streaming
+                                        if self.max_tokens and self.total_tokens >= self.max_tokens:
+                                            logger.warning(f"Token limit reached mid-file at '{rel_file}'.")
+                                            file_stopped_early = True
+                                            break
+
+                                    if file_stopped_early:
+                                        break
+
+                                if not file_stopped_early:
+                                    break  # Successfully read file
+
+                            except (OSError, PermissionError) as e:
+                                if self.verbose:
+                                    logger.warning(f"Skipping '{rel_file}' - {e}")
+                                # Undo the start delimiter tokens
+                                if self.count_tokens:
+                                    self.total_tokens -= get_tiktoken_token_count(start_header + "\n")
+                                break
+
+                        if file_stopped_early:
                             outfile.write("\n")
                             outfile.write(end_footer + "\n")
                             if self.count_tokens:
                                 self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
-
                             processed_count += 1
+                            break
 
-                            # Final check after file
-                            if self.max_tokens and self.total_tokens >= self.max_tokens:
-                                break
+                    # Ensure file ends with newline before end delimiter
+                    outfile.write("\n")
+                    outfile.write(end_footer + "\n")
+                    if self.count_tokens:
+                        self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
 
-                        except PermissionError as e:
-                            if self.verbose:
-                                logger.warning(f"Skipping '{rel_file}' - Permission denied: {e}")
-                        except Exception as e:
-                            if self.verbose:
-                                logger.error(f"Error processing '{rel_file}': {e}")
+                    processed_count += 1
 
-                    # Check if we hit token limit and need to stop processing directories
+                    # Final check after file
                     if self.max_tokens and self.total_tokens >= self.max_tokens:
                         break
 
@@ -1012,7 +1207,6 @@ class RepoProcessor:
 
         except Exception as e:
             logger.error(f"Fatal error: {e}")
-            # Clean up git worktree on fatal error
             self._cleanup_git_worktree()
             sys.exit(1)
 
