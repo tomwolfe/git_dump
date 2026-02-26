@@ -24,62 +24,185 @@ BINARY_EXTENSIONS: Set[str] = {
     '.pyc', '.pyo', '.class', '.o', '.a',
     '.db', '.sqlite', '.sqlite3',
     '.woff', '.woff2', '.ttf', '.eot',
+    '.parquet', '.pickle', '.pkl', '.npy', '.npz', '.h5', '.hdf5',
+    '.avi', '.mkv', '.wmv', '.flv', '.webm', '.m4v',
+    '.psd', '.ai', '.eps', '.indd',
+    '.key', '.numbers', '.pages',
 }
+
+# Default junk directories to ignore even if no .gitignore exists
+DEFAULT_JUNK_DIRS: Set[str] = {
+    '.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist', 'build',
+    '.tox', '.eggs', '*.egg-info', '.pytest_cache', '.mypy_cache', '.coverage',
+    '.husky', '.idea', '.vscode', '.vs', '.eclipse', '.settings',
+    'target', 'bin', 'obj', '.gradle', '.mvn',
+    '.cache', '.tmp', '.temp', 'tmp', 'temp',
+    'coverage', '.nyc_output', '.parcel-cache',
+}
+
+# Default ignore patterns for fail-safe filtering
+DEFAULT_IGNORE_PATTERNS: List[str] = [
+    '*.log', '*.pid', '*.lock', '*.swp', '*.swo', '*~',
+    '*.pyc', '*.pyo', '*.pyd',
+    '.DS_Store', 'Thumbs.db', 'desktop.ini',
+    '*.bak', '*.backup', '*.orig',
+    '.env', '.env.local', '.env.*.local',
+    '*.min.js', '*.min.css',
+    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+]
+
+# LLM instructions header to prepend to output
+LLM_INSTRUCTIONS = """--- INSTRUCTIONS ---
+This file contains a complete dump of the repository's source code for LLM analysis.
+
+Format:
+- The file starts with a directory tree structure (if enabled)
+- Each file is delimited with: ### File: <path>
+- Code blocks use markdown syntax with language hints (e.g., ```python)
+- Files are processed in alphabetical order within each directory
+
+Usage tips:
+- Reference files by their full relative path (e.g., "src/git_dump/core.py")
+- The tree structure matches the actual files included in the dump
+- Binary files, large files (>500KB), and ignored files are excluded
+--- END INSTRUCTIONS ---
+
+"""
 
 # Language mapping for markdown code blocks
 LANGUAGE_MAP: Dict[str, str] = {
     '.py': 'python',
+    '.pyw': 'python',
+    '.pyi': 'python',
     '.js': 'javascript',
+    '.mjs': 'javascript',
+    '.cjs': 'javascript',
     '.ts': 'typescript',
-    '.jsx': 'javascript',
     '.tsx': 'typescript',
+    '.jsx': 'javascript',
     '.java': 'java',
     '.c': 'c',
     '.cpp': 'cpp',
+    '.cc': 'cpp',
+    '.cxx': 'cpp',
     '.h': 'c',
     '.hpp': 'cpp',
+    '.hxx': 'cpp',
     '.cs': 'csharp',
     '.go': 'go',
     '.rs': 'rust',
     '.rb': 'ruby',
+    '.erb': 'erb',
     '.php': 'php',
+    '.phtml': 'php',
     '.swift': 'swift',
     '.kt': 'kotlin',
+    '.kts': 'kotlin',
     '.scala': 'scala',
+    '.sc': 'scala',
+    '.gradle': 'groovy',
+    '.groovy': 'groovy',
+    '.gvy': 'groovy',
+    '.gy': 'groovy',
+    '.gsh': 'groovy',
     '.sh': 'bash',
     '.bash': 'bash',
     '.zsh': 'bash',
     '.fish': 'fish',
+    '.ps1': 'powershell',
+    '.psm1': 'powershell',
+    '.psd1': 'powershell',
+    '.bat': 'batch',
+    '.cmd': 'batch',
     '.html': 'html',
+    '.htm': 'html',
+    '.xhtml': 'html',
     '.css': 'css',
     '.scss': 'scss',
     '.sass': 'sass',
     '.less': 'less',
+    '.styl': 'stylus',
     '.json': 'json',
+    '.json5': 'json',
+    '.jsonc': 'json',
     '.xml': 'xml',
+    '.xsd': 'xml',
+    '.xslt': 'xml',
     '.yaml': 'yaml',
     '.yml': 'yaml',
     '.toml': 'toml',
     '.ini': 'ini',
     '.cfg': 'ini',
     '.conf': 'ini',
+    '.config': 'ini',
     '.sql': 'sql',
+    '.plsql': 'sql',
+    '.mysql': 'sql',
+    '.psql': 'sql',
     '.md': 'markdown',
+    '.markdown': 'markdown',
+    '.mdx': 'mdx',
     '.rst': 'rst',
     '.tex': 'latex',
+    '.latex': 'latex',
     '.r': 'r',
     '.R': 'r',
+    '.rmd': 'rmd',
     '.m': 'matlab',
+    '.ml': 'ocaml',
+    '.mli': 'ocaml',
     '.lua': 'lua',
     '.pl': 'perl',
     '.pm': 'perl',
+    '.t': 'perl',
     '.hs': 'haskell',
+    '.lhs': 'haskell',
     '.ex': 'elixir',
     '.exs': 'elixir',
+    '.eex': 'eex',
+    '.leex': 'eex',
     '.erl': 'erlang',
+    '.hrl': 'erlang',
     '.clj': 'clojure',
+    '.cljs': 'clojure',
+    '.cljc': 'clojure',
+    '.edn': 'clojure',
     '.vue': 'vue',
     '.svelte': 'svelte',
+    '.dart': 'dart',
+    '.cmake': 'cmake',
+    '.make': 'makefile',
+    '.makefile': 'makefile',
+    'Makefile': 'makefile',
+    '.dockerfile': 'dockerfile',
+    'Dockerfile': 'dockerfile',
+    '.tf': 'terraform',
+    '.tfvars': 'terraform',
+    '.graphql': 'graphql',
+    '.gql': 'graphql',
+    '.proto': 'protobuf',
+    '.thrift': 'thrift',
+    '.avsc': 'avro',
+    '.jl': 'julia',
+    '.vim': 'vim',
+    '.exrc': 'vim',
+    '.tcl': 'tcl',
+    '.awk': 'awk',
+    '.sed': 'sed',
+    '.diff': 'diff',
+    '.patch': 'diff',
+    '.gitignore': 'gitignore',
+    '.gitattributes': 'gitattributes',
+    '.gitconfig': 'ini',
+    '.editorconfig': 'ini',
+    '.eslintrc': 'json',
+    '.prettierrc': 'json',
+    '.babelrc': 'json',
+    '.tsconfig': 'json',
+    '.jsconfig': 'json',
+    '.ipynb': 'jupyter',
+    '.sh-session': 'shell-session',
+    '.console': 'shell-session',
 }
 
 
@@ -126,7 +249,15 @@ def get_language_from_path(path: str) -> str:
     Returns:
         Language identifier for markdown code blocks
     """
-    ext = Path(path).suffix.lower()
+    path_obj = Path(path)
+    name = path_obj.name
+    ext = path_obj.suffix.lower()
+    
+    # Check full filename first for special cases like Dockerfile, Makefile
+    if name in LANGUAGE_MAP:
+        return LANGUAGE_MAP[name]
+    
+    # Then check extension
     return LANGUAGE_MAP.get(ext, '')
 
 
@@ -249,8 +380,15 @@ class RepoProcessor:
         Returns:
             True if the path should be ignored
         """
+        # Normalize path to use forward slashes
+        normalized = relative_path.replace('\\', '/')
+        parts = normalized.split('/')
+
+        # Check against default junk directories (fail-safe even without .gitignore)
+        if any(part in DEFAULT_JUNK_DIRS for part in parts):
+            return True
+
         # Always ignore .git directory
-        parts = relative_path.replace('\\', '/').split('/')
         if '.git' in parts:
             return True
 
@@ -259,12 +397,15 @@ class RepoProcessor:
         if abs_path == self.output_file:
             return True
 
-        # Normalize path to use forward slashes for pattern matching
-        normalized = relative_path.replace('\\', '/')
-
         # Check root-level spec and custom ignore patterns
         if self.spec and self.spec.match_file(normalized):
             return True
+
+        # Check default ignore patterns (fail-safe)
+        if self.use_gitignore and pathspec:
+            default_spec = pathspec.PathSpec.from_lines("gitwildmatch", DEFAULT_IGNORE_PATTERNS)
+            if default_spec.match_file(normalized):
+                return True
 
         # Cumulative nested check: Check every .gitignore from root to the file
         if self.use_gitignore and pathspec:
@@ -294,17 +435,47 @@ class RepoProcessor:
             with open(file_path, "rb") as f:
                 # Read first 8KB to check for binary content
                 chunk = f.read(8192)
-                # Check for null bytes
+                # Check for null bytes (common in binary files)
                 if b"\0" in chunk:
                     return True
-                # Try to decode as text - if it fails, it's likely binary
-                try:
-                    chunk.decode('utf-8')
-                except UnicodeDecodeError:
-                    return True
+                # Try to decode as text with multiple encodings
+                # If any succeed, it's likely a text file
+                for enc in ['utf-8', 'utf-8-sig', 'latin-1']:
+                    try:
+                        chunk.decode(enc)
+                        return False  # Successfully decoded, it's text
+                    except UnicodeDecodeError:
+                        continue
+                # All encodings failed, likely binary
+                return True
         except Exception:
             return True
-        return False
+
+    def _read_file_safely(self, file_path: Path) -> str:
+        """
+        Read a file with robust encoding fallback.
+
+        Tries multiple encodings in order: utf-8-sig (handles BOM), utf-8, then latin-1.
+        Latin-1 never fails as it maps all byte values to characters.
+
+        Args:
+            file_path: Path to the file to read
+
+        Returns:
+            File content as string, or error message if unreadable
+        """
+        encodings = ['utf-8-sig', 'utf-8', 'latin-1']
+
+        for enc in encodings:
+            try:
+                with open(file_path, "r", encoding=enc) as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                continue
+            except (OSError, PermissionError) as e:
+                return f"[Error: Could not read file - {e}]"
+
+        return "[Error: Could not decode file with any supported encoding]"
 
     def _should_include_in_tree(self, item_path: Path) -> bool:
         """
@@ -397,6 +568,12 @@ class RepoProcessor:
                 outfile = open(self.output_file, "w", encoding="utf-8", errors='replace')
 
             try:
+                # Write LLM instructions header first
+                if not self.dry_run:
+                    outfile.write(LLM_INSTRUCTIONS)
+                    if self.count_tokens:
+                        self.total_tokens += get_tiktoken_token_count(LLM_INSTRUCTIONS)
+
                 # Write repository structure tree if requested
                 if self.include_tree and not self.dry_run:
                     tree_structure = self.generate_tree_structure()
@@ -462,12 +639,21 @@ class RepoProcessor:
                             if self.count_tokens:
                                 self.total_tokens += get_tiktoken_token_count(start_header + "\n")
 
-                            # STREAM file content directly to output (memory efficient)
-                            with open(file_path, "r", encoding="utf-8", errors='replace') as infile:
-                                for chunk in infile:
-                                    outfile.write(chunk)
-                                    if self.count_tokens:
-                                        self.total_tokens += get_tiktoken_token_count(chunk)
+                            # Read file content with robust encoding fallback
+                            content = self._read_file_safely(file_path)
+                            if content.startswith("[Error:"):
+                                if self.verbose:
+                                    logger.warning(f"Skipping '{rel_file}' - {content}")
+                                continue
+
+                            # STREAM file content to output (memory efficient for large files)
+                            # Write in chunks to avoid loading entire file into memory for token counting
+                            chunk_size = 8192
+                            for i in range(0, len(content), chunk_size):
+                                chunk = content[i:i + chunk_size]
+                                outfile.write(chunk)
+                                if self.count_tokens:
+                                    self.total_tokens += get_tiktoken_token_count(chunk)
 
                             # Ensure file ends with newline before end delimiter
                             outfile.write("\n")
@@ -476,9 +662,9 @@ class RepoProcessor:
                                 self.total_tokens += get_tiktoken_token_count(end_footer + "\n")
 
                             processed_count += 1
-                        except (UnicodeDecodeError, PermissionError) as e:
+                        except PermissionError as e:
                             if self.verbose:
-                                logger.warning(f"Skipping '{rel_file}' - {e}")
+                                logger.warning(f"Skipping '{rel_file}' - Permission denied: {e}")
                         except Exception as e:
                             if self.verbose:
                                 logger.error(f"Error processing '{rel_file}': {e}")

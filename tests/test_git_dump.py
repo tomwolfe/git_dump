@@ -3,7 +3,10 @@ import shutil
 import tempfile
 import pytest
 from pathlib import Path
-from src.git_dump.core import RepoProcessor, get_language_from_path, BINARY_EXTENSIONS
+from src.git_dump.core import (
+    RepoProcessor, get_language_from_path, BINARY_EXTENSIONS,
+    DEFAULT_JUNK_DIRS, DEFAULT_IGNORE_PATTERNS, LLM_INSTRUCTIONS
+)
 
 
 class TestRepoProcessor:
@@ -323,3 +326,234 @@ def test_gitignore_cache():
         assert os.path.join(test_dir, "subdir2") in processor.gitignore_cache
     finally:
         shutil.rmtree(test_dir)
+
+
+class TestDefaultJunkDirs:
+    """Test fail-safe default ignore patterns."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_node_modules_ignored_by_default(self):
+        """Test that node_modules is ignored even without .gitignore."""
+        self.create_file("node_modules/package/index.js", "module.exports = {}")
+        self.create_file("src/main.js", "console.log('hello')")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        count = processor.process()
+
+        assert count == 1  # Only src/main.js
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert "node_modules" not in content
+            assert "src/main.js" in content
+
+    def test_venv_ignored_by_default(self):
+        """Test that .venv and venv are ignored by default."""
+        self.create_file(".venv/lib/python3.9/site-packages/pkg.py", "pass")
+        self.create_file("venv/bin/activate", "#!/bin/bash")
+        self.create_file("app.py", "print('hello')")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        count = processor.process()
+
+        assert count == 1  # Only app.py
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert ".venv" not in content
+            assert "venv" not in content
+            assert "app.py" in content
+
+    def test_build_artifacts_ignored_by_default(self):
+        """Test that build, dist, __pycache__ are ignored by default."""
+        self.create_file("build/output.exe", "binary")
+        self.create_file("dist/package.whl", "archive")
+        self.create_file("__pycache__/module.pyc", "compiled")
+        self.create_file("src/module.py", "def func(): pass")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        count = processor.process()
+
+        assert count == 1  # Only src/module.py
+
+
+class TestDefaultIgnorePatterns:
+    """Test fail-safe default ignore patterns."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_log_files_ignored_by_default(self):
+        """Test that .log files are ignored by default."""
+        self.create_file("app.log", "log content")
+        self.create_file("logs/debug.log", "debug info")
+        self.create_file("src/main.py", "print('hello')")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        count = processor.process()
+
+        assert count == 1  # Only src/main.py
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert ".log" not in content
+            assert "src/main.py" in content
+
+    def test_env_files_ignored_by_default(self):
+        """Test that .env files are ignored by default."""
+        self.create_file(".env", "SECRET_KEY=abc123")
+        self.create_file(".env.local", "DEBUG=true")
+        self.create_file("app.py", "print('hello')")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        count = processor.process()
+
+        assert count == 1  # Only app.py
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert ".env" not in content
+            assert "app.py" in content
+
+    def test_pyc_files_ignored_by_default(self):
+        """Test that .pyc files are ignored by default."""
+        self.create_file("module.pyc", "compiled")
+        self.create_file("module.py", "def func(): pass")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        count = processor.process()
+
+        assert count == 1  # Only module.py
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert "module.pyc" not in content
+            assert "module.py" in content
+
+
+class TestLLMInstructions:
+    """Test LLM instructions header."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def test_llm_instructions_present(self):
+        """Test that LLM instructions are at the top of the output."""
+        self.create_file("main.py", "print('hello')")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        processor.process()
+
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert content.startswith("--- INSTRUCTIONS ---")
+            assert "--- END INSTRUCTIONS ---" in content
+            assert "LLM" in content
+
+    def test_llm_instructions_counted_in_tokens(self):
+        """Test that LLM instructions are included in token count."""
+        self.create_file("main.py", "print('hello')")
+
+        processor = RepoProcessor(
+            self.test_dir, self.output_file,
+            count_tokens=True, include_tree=False
+        )
+        processor.process()
+
+        # Token count should include instructions
+        assert processor.total_tokens > 0
+
+
+class TestRobustFileReading:
+    """Test robust file reading with encoding fallback."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_file = os.path.join(self.test_dir, "output.txt")
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    def create_file(self, path, content, encoding='utf-8'):
+        full_path = os.path.join(self.test_dir, path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding=encoding) as f:
+            f.write(content)
+
+    def test_utf8_with_bom(self):
+        """Test reading UTF-8 files with BOM (common in Windows)."""
+        # Create file with UTF-8 BOM
+        full_path = os.path.join(self.test_dir, "windows_file.py")
+        with open(full_path, "w", encoding="utf-8-sig") as f:
+            f.write("# -*- coding: utf-8 -*-\nprint('hello')")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        count = processor.process()
+
+        assert count == 1
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            assert "print('hello')" in content
+
+    def test_latin1_fallback(self):
+        """Test that latin-1 encoding works as fallback."""
+        # Create file with latin-1 encoded content in a subdirectory
+        full_path = os.path.join(self.test_dir, "texts", "french.txt")
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="latin-1") as f:
+            f.write("Café, naïve, résumé")
+
+        processor = RepoProcessor(self.test_dir, self.output_file, include_tree=False)
+        count = processor.process()
+
+        assert count == 1
+        with open(self.output_file, "r", encoding="utf-8") as f:
+            content = f.read()
+            # Content should be readable (may have different byte representation)
+            assert "french.txt" in content
+            # The accented characters should be present in some form
+            assert "Caf" in content
+
+
+class TestExpandedLanguageMap:
+    """Test expanded language detection."""
+
+    def test_more_languages(self):
+        """Test detection of additional languages."""
+        assert get_language_from_path("script.dart") == "dart"
+        assert get_language_from_path("script.groovy") == "groovy"
+        assert get_language_from_path("infrastructure.tf") == "terraform"
+        assert get_language_from_path("query.graphql") == "graphql"
+        assert get_language_from_path("notebook.ipynb") == "jupyter"
+        assert get_language_from_path("Dockerfile") == "dockerfile"
+        assert get_language_from_path("Makefile") == "makefile"
+        assert get_language_from_path("script.ps1") == "powershell"
+        assert get_language_from_path("config.toml") == "toml"
+        assert get_language_from_path("data.parquet") in ["", "parquet"]
